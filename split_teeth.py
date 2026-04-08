@@ -1,0 +1,304 @@
+"""
+Tách CBCT volume chứa nhiều răng thành các volume răng riêng lẻ.
+
+Chiến lược:
+    1. Load CBCT volume + label mask (label: 0=bg, 1=tooth, 2=canal)
+    2. Áp dụng connected component analysis trên tooth mask (label=1)
+       để phân biệt các răng riêng lẻ (mỗi răng là 1 component)
+    3. Với mỗi component (mỗi răng):
+        - Tính bounding box
+        - Mở rộng thêm margin để chứa đầy đủ chân răng + mô xung quanh
+        - Crop cả image và mask
+        - Chỉ giữ lại tooth + canal thuộc răng đó (loại bỏ các răng khác
+          có thể lọt vào bounding box)
+    4. Lưu từng răng thành file .nii.gz riêng
+
+Cách dùng:
+    python split_teeth.py --image data/raw/SLZ000.nii.gz \
+                          --label data/raw/SLZ000-label.nii.gz \
+                          --output data/teeth/ \
+                          --case_id SLZ000
+
+    # Hoặc xử lý toàn bộ thư mục:
+    python split_teeth.py --batch --input_dir data/raw --output data/teeth/
+"""
+import argparse
+import os
+from pathlib import Path
+from typing import List, Tuple
+
+import nibabel as nib
+import numpy as np
+from scipy import ndimage
+
+
+def load_nifti(path: str) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
+    """Load NIfTI file, trả về (data, affine, header)."""
+    img = nib.load(path)
+    return img.get_fdata(), img.affine, img.header
+
+
+def save_nifti(data: np.ndarray, affine: np.ndarray, header, path: str):
+    """Lưu numpy array thành NIfTI."""
+    img = nib.Nifti1Image(data.astype(np.float32), affine=affine, header=header)
+    nib.save(img, path)
+
+
+def find_individual_teeth(
+    label: np.ndarray,
+    tooth_label: int = 1,
+    min_voxels: int = 5000,
+) -> Tuple[np.ndarray, int]:
+    """
+    Phân tách các răng riêng lẻ bằng connected component analysis.
+
+    Args:
+        label: mask 3D (int)
+        tooth_label: giá trị label của răng (thường = 1)
+        min_voxels: ngưỡng tối thiểu để loại bỏ noise / component nhỏ
+
+    Returns:
+        components: mảng 3D cùng shape với label, mỗi răng có 1 số nguyên
+        num_teeth: số lượng răng tìm được
+    """
+    tooth_mask = (label == tooth_label).astype(np.uint8)
+
+    # Connectivity = 1 (6-connectivity) để tránh nối nhầm 2 răng
+    # gần nhau qua điểm góc. Có thể tăng lên 2 hoặc 3 nếu răng bị tách rời.
+    structure = ndimage.generate_binary_structure(3, 1)
+    labeled, num_found = ndimage.label(tooth_mask, structure=structure)
+
+    # Lọc bỏ các component quá nhỏ (nhiễu)
+    component_sizes = ndimage.sum(tooth_mask, labeled, range(1, num_found + 1))
+    keep_mask = component_sizes >= min_voxels
+
+    # Relabel: chỉ giữ components lớn
+    new_labeled = np.zeros_like(labeled)
+    new_idx = 1
+    for i, keep in enumerate(keep_mask):
+        if keep:
+            new_labeled[labeled == (i + 1)] = new_idx
+            new_idx += 1
+
+    num_teeth = new_idx - 1
+    return new_labeled, num_teeth
+
+
+def get_bounding_box(
+    mask: np.ndarray,
+    margin: int = 10,
+) -> Tuple[slice, slice, slice]:
+    """
+    Tính bounding box 3D của mask với margin.
+    Trả về tuple các slice để có thể dùng trực tiếp: volume[bbox].
+    """
+    coords = np.array(np.where(mask > 0))
+    if coords.size == 0:
+        return None
+
+    min_coords = coords.min(axis=1)
+    max_coords = coords.max(axis=1) + 1  # +1 vì slice không bao gồm end
+
+    # Mở rộng margin nhưng clip trong biên volume
+    min_coords = np.maximum(min_coords - margin, 0)
+    max_coords = np.minimum(max_coords + margin, mask.shape)
+
+    return tuple(slice(min_coords[i], max_coords[i]) for i in range(3))
+
+
+def extract_single_tooth(
+    image: np.ndarray,
+    label: np.ndarray,
+    tooth_components: np.ndarray,
+    tooth_idx: int,
+    margin: int = 15,
+    canal_label: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Trích xuất 1 răng riêng lẻ từ volume.
+
+    Args:
+        image: CBCT volume gốc
+        label: mask gốc (0=bg, 1=tooth, 2=canal)
+        tooth_components: mảng components từ find_individual_teeth
+        tooth_idx: index của răng cần trích xuất (1, 2, ..., num_teeth)
+        margin: margin voxel quanh bounding box
+        canal_label: label của canal
+
+    Returns:
+        cropped_image, cropped_label (đã được làm sạch chỉ chứa 1 răng)
+    """
+    # Tạo mask chỉ chứa răng hiện tại
+    this_tooth_mask = (tooth_components == tooth_idx)
+
+    # Tính bounding box với margin
+    bbox = get_bounding_box(this_tooth_mask, margin=margin)
+    if bbox is None:
+        return None, None
+
+    # Crop image và label gốc
+    cropped_image = image[bbox].copy()
+    cropped_label_full = label[bbox].copy()
+    cropped_tooth_mask = this_tooth_mask[bbox]
+
+    # Làm sạch: chỉ giữ tooth + canal thuộc răng này
+    # (vì bounding box có thể chứa một phần của răng bên cạnh)
+    cropped_label = np.zeros_like(cropped_label_full)
+
+    # Gán lại tooth (chỉ trong component của răng hiện tại)
+    cropped_label[cropped_tooth_mask] = 1
+
+    # Gán canal: chỉ những canal voxels nằm trong bounding box của răng này
+    # VÀ nằm bên trong (hoặc rất gần) răng hiện tại.
+    # Dùng dilation nhẹ của tooth mask để bao phủ canal chạm vào răng.
+    tooth_dilated = ndimage.binary_dilation(cropped_tooth_mask, iterations=2)
+    canal_mask = (cropped_label_full == canal_label) & tooth_dilated
+    cropped_label[canal_mask] = 2
+
+    return cropped_image, cropped_label
+
+
+def process_case(
+    image_path: str,
+    label_path: str,
+    output_dir: str,
+    case_id: str,
+    margin: int = 15,
+    min_voxels: int = 5000,
+) -> int:
+    """
+    Xử lý 1 ca CBCT: tách thành các file răng riêng lẻ.
+
+    Returns:
+        Số lượng răng đã được lưu
+    """
+    print(f"\n[{case_id}] Loading {image_path}")
+    image, affine, header = load_nifti(image_path)
+    label, _, label_header = load_nifti(label_path)
+
+    print(f"  Volume shape: {image.shape}")
+    print(f"  Label unique values: {np.unique(label.astype(int))}")
+
+    # Phân tách các răng riêng lẻ
+    components, num_teeth = find_individual_teeth(
+        label.astype(int), tooth_label=1, min_voxels=min_voxels
+    )
+    print(f"  Tìm thấy {num_teeth} răng")
+
+    if num_teeth == 0:
+        print(f"  [WARN] Không tìm thấy răng nào trong {case_id}")
+        return 0
+
+    # Tạo thư mục output
+    out_img_dir = Path(output_dir) / "images"
+    out_lbl_dir = Path(output_dir) / "masks"
+    out_img_dir.mkdir(parents=True, exist_ok=True)
+    out_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+    # Trích xuất và lưu từng răng
+    for tooth_idx in range(1, num_teeth + 1):
+        cropped_img, cropped_lbl = extract_single_tooth(
+            image, label, components, tooth_idx,
+            margin=margin, canal_label=2,
+        )
+
+        if cropped_img is None:
+            continue
+
+        # Thống kê
+        n_tooth = int((cropped_lbl == 1).sum())
+        n_canal = int((cropped_lbl == 2).sum())
+        has_canal = "OK" if n_canal > 0 else "NO_CANAL"
+
+        # Đặt tên: <case_id>_tooth<idx>.nii.gz
+        out_name = f"{case_id}_tooth{tooth_idx:02d}.nii.gz"
+        img_out = out_img_dir / out_name
+        lbl_out = out_lbl_dir / out_name
+
+        save_nifti(cropped_img, affine, header, str(img_out))
+        save_nifti(cropped_lbl, affine, label_header, str(lbl_out))
+
+        print(
+            f"  Răng {tooth_idx:02d}: shape={cropped_img.shape} "
+            f"tooth={n_tooth:,}vx canal={n_canal:,}vx [{has_canal}] -> {out_name}"
+        )
+
+    return num_teeth
+
+
+def batch_process(input_dir: str, output_dir: str, margin: int, min_voxels: int):
+    """Tự động tìm cặp image/label trong input_dir và xử lý toàn bộ."""
+    input_path = Path(input_dir)
+
+    # Tìm tất cả file image (không chứa 'label' trong tên)
+    all_files = sorted(list(input_path.glob("*.nii.gz")) + list(input_path.glob("*.nii")))
+    image_files = [f for f in all_files if "label" not in f.name.lower()
+                   and "mask" not in f.name.lower() and "seg" not in f.name.lower()]
+
+    print(f"Tìm thấy {len(image_files)} file image trong {input_dir}")
+
+    total_teeth = 0
+    for img_file in image_files:
+        stem = img_file.name.replace(".nii.gz", "").replace(".nii", "")
+        # Tìm label tương ứng (pattern: <stem>-label.nii.gz hoặc <stem>_label.nii.gz)
+        candidates = [
+            input_path / f"{stem}-label.nii.gz",
+            input_path / f"{stem}_label.nii.gz",
+            input_path / f"{stem}-mask.nii.gz",
+            input_path / f"{stem}_seg.nii.gz",
+        ]
+        label_file = next((c for c in candidates if c.exists()), None)
+        if label_file is None:
+            print(f"[SKIP] Không tìm thấy label cho {img_file.name}")
+            continue
+
+        n = process_case(
+            str(img_file), str(label_file), output_dir, case_id=stem,
+            margin=margin, min_voxels=min_voxels,
+        )
+        total_teeth += n
+
+    print(f"\n=== HOÀN TẤT ===")
+    print(f"Tổng số răng đã trích xuất: {total_teeth}")
+    print(f"Lưu tại: {output_dir}/images và {output_dir}/masks")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Tách CBCT volume thành các răng riêng lẻ"
+    )
+    parser.add_argument("--image", type=str, help="Đường dẫn file CBCT")
+    parser.add_argument("--label", type=str, help="Đường dẫn file label")
+    parser.add_argument("--output", type=str, default="./data/teeth",
+                        help="Thư mục output")
+    parser.add_argument("--case_id", type=str, default="case",
+                        help="ID của ca (dùng làm prefix cho file output)")
+    parser.add_argument("--margin", type=int, default=15,
+                        help="Margin (voxel) quanh bounding box của răng")
+    parser.add_argument("--min_voxels", type=int, default=5000,
+                        help="Số voxel tối thiểu để coi là 1 răng (lọc noise)")
+    parser.add_argument("--batch", action="store_true",
+                        help="Xử lý toàn bộ thư mục")
+    parser.add_argument("--input_dir", type=str,
+                        help="Thư mục chứa các file CBCT (dùng với --batch)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.batch:
+        if not args.input_dir:
+            raise ValueError("--batch yêu cầu --input_dir")
+        batch_process(args.input_dir, args.output, args.margin, args.min_voxels)
+    else:
+        if not args.image or not args.label:
+            raise ValueError("Cần --image và --label (hoặc dùng --batch)")
+        process_case(
+            args.image, args.label, args.output, args.case_id,
+            margin=args.margin, min_voxels=args.min_voxels,
+        )
+
+
+if __name__ == "__main__":
+    main()

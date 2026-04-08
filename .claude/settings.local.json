@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm list:*)",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('C:/Users/Trung Truc/PycharmProjects/Research/segment/training.ipynb'\\)\\); [print\\(i, c.get\\('id','?'\\), c['cell_type']\\) for i,c in enumerate\\(nb['cells']\\)]\")"
+    ]
+  }
+}
