@@ -1,8 +1,10 @@
 torch>=2.0.0
-monai>=1.3.0
+monai>=1.4.0     # >=1.3.2 fix FileFinder bug trên Python 3.12
 nibabel>=5.0.0
 numpy>=1.24.0
 scikit-learn>=1.3.0
 scipy>=1.11.0
 tensorboard>=2.14.0
 pynrrd>=1.0.0
+einops>=0.7.0
+timm>=0.9.0

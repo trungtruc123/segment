@@ -80,6 +80,8 @@ class KFoldTrainer(Trainer):
             self.criterion = DeepSupervisionLoss(base_loss)
         else:
             self.criterion = base_loss
+        # Move loss (và registered buffers như alpha, class_weights) sang GPU
+        self.criterion = self.criterion.to(self.device)
 
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),

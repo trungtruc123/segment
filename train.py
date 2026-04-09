@@ -85,6 +85,9 @@ class Trainer:
             self.criterion = DeepSupervisionLoss(base_loss)
         else:
             self.criterion = base_loss
+        # Move loss sang GPU để registered buffers (alpha, class_weights)
+        # nằm cùng device với logits/targets → tránh device mismatch
+        self.criterion = self.criterion.to(self.device)
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
