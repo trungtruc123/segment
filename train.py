@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from monai.inferers import sliding_window_inference
 from monai.metrics import DiceMetric
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from config import AugmentConfig, DataConfig, ModelConfig, TrainConfig
@@ -115,7 +115,7 @@ class Trainer:
             )
 
         # AMP scaler
-        self.scaler = GradScaler(enabled=train_config.use_amp)
+        self.scaler = GradScaler("cuda", enabled=train_config.use_amp)
         self.use_amp = train_config.use_amp
 
         # Dataloaders
@@ -152,7 +152,7 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
-            with autocast(enabled=self.use_amp):
+            with autocast("cuda", enabled=self.use_amp):
                 output = self.model(images)
 
                 # Chuẩn hóa output của các kiến trúc khác nhau:

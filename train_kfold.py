@@ -55,7 +55,7 @@ class KFoldTrainer(Trainer):
         # Cách đơn giản: copy phần init quan trọng, bỏ qua phần load data.
         from losses import CombinedLoss, DeepSupervisionLoss
         from model import build_model
-        from torch.cuda.amp import GradScaler
+        from torch.amp import GradScaler
         from torch.utils.tensorboard import SummaryWriter
 
         self.data_config = data_config
@@ -105,7 +105,7 @@ class KFoldTrainer(Trainer):
                 total_iters=train_config.warmup_epochs,
             )
 
-        self.scaler = GradScaler(enabled=train_config.use_amp)
+        self.scaler = GradScaler("cuda", enabled=train_config.use_amp)
         self.use_amp = train_config.use_amp
 
         # Dùng dataloaders được truyền vào, bỏ qua test_loader
