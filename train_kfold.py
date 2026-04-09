@@ -74,9 +74,9 @@ class KFoldTrainer(Trainer):
             dice_weight=train_config.dice_weight,
             focal_weight=train_config.focal_weight,
             focal_gamma=train_config.focal_gamma,
-            focal_alpha=train_config.focal_alpha,
+            class_weights=train_config.class_weights,
         )
-        if model_config.architecture == "unet3d":
+        if model_config.architecture in ("unet3d", "nnunet"):
             self.criterion = DeepSupervisionLoss(base_loss)
         else:
             self.criterion = base_loss
@@ -253,8 +253,8 @@ def parse_args():
         description="K-fold Cross-Validation cho CBCT Tooth & Canal Segmentation"
     )
     parser.add_argument("--data_dir", type=str, default="./data/teeth")
-    parser.add_argument("--arch", type=str, default="swin_unetr",
-                        choices=["unet3d", "swin_unetr"])
+    parser.add_argument("--arch", type=str, default="nnunet",
+                        choices=["nnunet", "unet3d", "swin_unetr"])
     parser.add_argument("--n_folds", type=int, default=4,
                         help="Số fold (mặc định 4 - tương ứng 4 ca CBCT)")
     parser.add_argument("--only_fold", type=int, default=None,

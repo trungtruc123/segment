@@ -11,15 +11,36 @@ import torch.nn.functional as F
 
 class DiceLoss(nn.Module):
     """
-    Soft Dice Loss for multi-class segmentation.
-    Computes per-class dice and returns 1 - mean(dice).
+    Soft Dice Loss for multi-class segmentation with optional per-class weights.
+
+    Tính (1 - dice) cho từng class rồi lấy trung bình có trọng số.
+    Trọng số [1, 1, 5] ưu tiên class canal gấp 5 lần → model bị phạt
+    mạnh hơn khi bỏ sót canal.
     """
 
-    def __init__(self, num_classes: int = 3, smooth: float = 1e-5, ignore_bg: bool = False):
+    def __init__(
+        self,
+        num_classes: int = 3,
+        smooth: float = 1e-5,
+        ignore_bg: bool = False,
+        class_weights: Optional[List[float]] = None,
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.smooth = smooth
         self.ignore_bg = ignore_bg
+
+        if class_weights is not None:
+            assert len(class_weights) == num_classes, (
+                f"class_weights phải có độ dài {num_classes}, "
+                f"nhận được {len(class_weights)}"
+            )
+            self.register_buffer(
+                "class_weights",
+                torch.tensor(class_weights, dtype=torch.float32),
+            )
+        else:
+            self.class_weights = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -35,7 +56,8 @@ class DiceLoss(nn.Module):
         targets_one_hot = targets_one_hot.permute(0, 4, 1, 2, 3).float()  # (B, C, D, H, W)
 
         start_class = 1 if self.ignore_bg else 0
-        dice_scores = []
+        per_class_losses = []
+        per_class_weights = []
 
         for c in range(start_class, self.num_classes):
             pred_c = probs[:, c]
@@ -43,10 +65,17 @@ class DiceLoss(nn.Module):
             intersection = (pred_c * target_c).sum()
             union = pred_c.sum() + target_c.sum()
             dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
-            dice_scores.append(dice)
+            per_class_losses.append(1.0 - dice)
 
-        mean_dice = torch.stack(dice_scores).mean()
-        return 1.0 - mean_dice
+            if self.class_weights is not None:
+                per_class_weights.append(self.class_weights[c])
+            else:
+                per_class_weights.append(torch.tensor(1.0, device=logits.device))
+
+        losses = torch.stack(per_class_losses)
+        weights = torch.stack(per_class_weights).to(losses.device)
+        # Weighted mean (chuẩn hóa theo tổng trọng số)
+        return (losses * weights).sum() / weights.sum()
 
 
 class FocalLoss(nn.Module):
@@ -95,8 +124,12 @@ class FocalLoss(nn.Module):
 
 class CombinedLoss(nn.Module):
     """
-    Combined Dice + Focal loss.
-    loss = dice_weight * DiceLoss + focal_weight * FocalLoss
+    Combined Dice + Focal loss với class weights.
+
+        loss = dice_weight * WeightedDiceLoss + focal_weight * FocalLoss
+
+    class_weights được áp dụng cho CẢ dice và focal để model bị phạt
+    nhất quán khi sai ở class canal. Mặc định [1, 1, 5] → canal x5.
     """
 
     def __init__(
@@ -105,15 +138,25 @@ class CombinedLoss(nn.Module):
         dice_weight: float = 1.0,
         focal_weight: float = 1.0,
         focal_gamma: float = 2.0,
-        focal_alpha: Optional[List[float]] = None,
+        class_weights: Optional[List[float]] = None,
     ):
         super().__init__()
-        self.dice_loss = DiceLoss(num_classes=num_classes)
+        # Dùng cùng class_weights cho cả dice và focal
+        if class_weights is None:
+            class_weights = [1.0, 1.0, 5.0]  # default: canal x5
+
+        self.dice_loss = DiceLoss(
+            num_classes=num_classes,
+            class_weights=class_weights,
+        )
         self.focal_loss = FocalLoss(
-            gamma=focal_gamma, alpha=focal_alpha, num_classes=num_classes
+            gamma=focal_gamma,
+            alpha=class_weights,  # reuse cho focal
+            num_classes=num_classes,
         )
         self.dice_weight = dice_weight
         self.focal_weight = focal_weight
+        self.class_weights = class_weights
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         d_loss = self.dice_loss(logits, targets)

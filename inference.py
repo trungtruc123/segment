@@ -186,7 +186,8 @@ def parse_args():
                              "Sẽ tự động chọn fold có val dice cao nhất.")
     parser.add_argument("--input_dir", type=str, required=True, help="Directory with input volumes")
     parser.add_argument("--output_dir", type=str, default="./predictions")
-    parser.add_argument("--arch", type=str, default="swin_unetr", choices=["unet3d", "swin_unetr"])
+    parser.add_argument("--arch", type=str, default="nnunet",
+                        choices=["nnunet", "unet3d", "swin_unetr"])
     parser.add_argument("--patch_size", type=int, nargs=3, default=[96, 96, 96])
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--no_tta", action="store_true", help="Disable test-time augmentation")

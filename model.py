@@ -6,7 +6,7 @@ from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-from monai.networks.nets import SwinUNETR
+from monai.networks.nets import DynUNet, SwinUNETR
 
 from config import ModelConfig
 
@@ -103,6 +103,53 @@ class UNet3D(nn.Module):
         return output
 
 
+def build_nnunet(
+    config: ModelConfig,
+    img_size: Tuple[int, int, int] = (96, 96, 96),
+) -> DynUNet:
+    """
+    Build nnU-Net architecture via MONAI's DynUNet.
+
+    DynUNet là implementation chính thức của nnU-Net trong MONAI:
+        - Instance normalization
+        - LeakyReLU (slope 0.01)
+        - Deep supervision ở nhiều decoder levels
+        - Không có residual (standard nnUNet)
+        - Strided conv cho downsampling, transposed conv cho upsampling
+
+    Với patch 96x96x96, dùng 5 levels downsampling (96 -> 48 -> 24 -> 12 -> 6 -> 3).
+    """
+    # Kernel + stride theo công thức của nnU-Net:
+    #   Level 0: không downsample
+    #   Các level sau: stride=2 nếu spatial dim còn chia được cho 2
+    kernel_size = [[3, 3, 3]] * 6
+    strides = [
+        [1, 1, 1],  # level 0
+        [2, 2, 2],  # level 1: 96 -> 48
+        [2, 2, 2],  # level 2: 48 -> 24
+        [2, 2, 2],  # level 3: 24 -> 12
+        [2, 2, 2],  # level 4: 12 -> 6
+        [2, 2, 2],  # level 5: 6 -> 3 (bottleneck)
+    ]
+    upsample_kernel_size = strides[1:]  # DynUNet yêu cầu
+
+    model = DynUNet(
+        spatial_dims=3,
+        in_channels=config.in_channels,
+        out_channels=config.num_classes,
+        kernel_size=kernel_size,
+        strides=strides,
+        upsample_kernel_size=upsample_kernel_size,
+        norm_name="instance",
+        act_name=("leakyrelu", {"inplace": True, "negative_slope": 0.01}),
+        deep_supervision=True,
+        deep_supr_num=2,         # supervise 2 decoder levels ngoài output chính
+        res_block=False,         # standard nnUNet, không dùng residual
+        trans_bias=False,
+    )
+    return model
+
+
 def build_swin_unetr(config: ModelConfig, img_size: Tuple[int, int, int] = (96, 96, 96)) -> SwinUNETR:
     """Build Swin-UNETR model from MONAI."""
     model = SwinUNETR(
@@ -131,6 +178,8 @@ def build_model(config: ModelConfig, img_size: Tuple[int, int, int] = (96, 96, 9
             num_classes=config.num_classes,
             features=config.unet_features,
         )
+    elif config.architecture == "nnunet":
+        model = build_nnunet(config, img_size)
     elif config.architecture == "swin_unetr":
         model = build_swin_unetr(config, img_size)
     else:

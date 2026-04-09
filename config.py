@@ -38,7 +38,7 @@ class AugmentConfig:
 
 @dataclass
 class ModelConfig:
-    architecture: str = "swin_unetr"  # "unet3d" or "swin_unetr"
+    architecture: str = "nnunet"  # "nnunet" | "unet3d" | "swin_unetr"
     in_channels: int = 1
     num_classes: int = 3
     # UNet3D settings
@@ -52,27 +52,31 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    epochs: int = 300
-    batch_size: int = 2
-    num_workers: int = 4
-    learning_rate: float = 1e-4
-    weight_decay: float = 1e-5
-    scheduler: str = "cosine"  # "cosine" or "poly"
-    warmup_epochs: int = 10
-    # Loss
+    # Hyperparameters đã tune riêng cho dataset nhỏ (24 răng / 4 CBCT)
+    # và kiến trúc nnU-Net (DynUNet) trên Colab Pro T4.
+    epochs: int = 200
+    batch_size: int = 4              # nnU-Net nhẹ, T4 16GB OK với patch 96³
+    num_workers: int = 2             # Colab shared memory limit
+    learning_rate: float = 3e-4      # nnU-Net AdamW standard
+    weight_decay: float = 3e-5       # nnU-Net standard
+    scheduler: str = "cosine"        # "cosine" or "poly"
+    warmup_epochs: int = 5
+    # Loss: Dice + Focal với class weights
+    # class_weights áp dụng cho cả dice và focal loss.
+    # Canal x5 vì là class nhỏ nhất và quan trọng nhất.
     dice_weight: float = 1.0
     focal_weight: float = 1.0
     focal_gamma: float = 2.0
-    focal_alpha: List[float] = field(default_factory=lambda: [0.1, 0.4, 0.5])  # bg, tooth, canal
+    class_weights: List[float] = field(default_factory=lambda: [1.0, 1.0, 5.0])  # bg, tooth, canal
     # Canal oversampling
     oversample_canal: bool = True
-    canal_oversample_ratio: float = 3.0  # how much more to sample canal-heavy patches
+    canal_oversample_ratio: float = 3.0
     # Two-stage pipeline
-    two_stage: bool = False  # stage1: tooth ROI, stage2: canal refinement
+    two_stage: bool = False
     # Checkpointing
     checkpoint_dir: str = "./checkpoints"
     save_every: int = 10
-    early_stopping_patience: int = 30
+    early_stopping_patience: int = 25
     # Mixed precision
     use_amp: bool = True
     # Logging

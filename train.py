@@ -76,9 +76,12 @@ class Trainer:
             dice_weight=train_config.dice_weight,
             focal_weight=train_config.focal_weight,
             focal_gamma=train_config.focal_gamma,
-            focal_alpha=train_config.focal_alpha,
+            class_weights=train_config.class_weights,
         )
-        if model_config.architecture == "unet3d":
+        print(f"Loss: Dice + Focal với class_weights={train_config.class_weights} "
+              f"(bg, tooth, canal)")
+        # Cả UNet3D và DynUNet (nnU-Net) đều dùng deep supervision
+        if model_config.architecture in ("unet3d", "nnunet"):
             self.criterion = DeepSupervisionLoss(base_loss)
         else:
             self.criterion = base_loss
@@ -149,10 +152,28 @@ class Trainer:
             with autocast(enabled=self.use_amp):
                 output = self.model(images)
 
-                # Handle deep supervision (UNet3D in training mode)
+                # Chuẩn hóa output của các kiến trúc khác nhau:
+                #   - UNet3D training mode: trả về (main_tensor, [deep1, deep2, ...])
+                #   - DynUNet (nnU-Net) training mode với deep_supervision=True:
+                #       trả về 1 tensor stack shape (B, N+1, C, D, H, W),
+                #       dim=1 index 0 là main output, còn lại là deep supervision
+                #   - SwinUNETR / eval: trả về 1 tensor (B, C, D, H, W)
                 if isinstance(output, tuple):
+                    # UNet3D
                     main_out, deep_outs = output
                     loss = self.criterion(main_out, deep_outs, labels)
+                elif output.dim() == 6:
+                    # DynUNet stacked output
+                    main_out = output[:, 0]
+                    deep_outs = [output[:, i] for i in range(1, output.shape[1])]
+                    if isinstance(self.criterion, DeepSupervisionLoss):
+                        loss = self.criterion(main_out, deep_outs, labels)
+                    else:
+                        # Fallback: weighted sum giống deep supervision
+                        loss = self.criterion(main_out, labels)
+                        weights = [0.5, 0.25, 0.125]
+                        for i, deep_out in enumerate(deep_outs[:len(weights)]):
+                            loss = loss + weights[i] * self.criterion(deep_out, labels)
                 else:
                     loss = self.criterion(output, labels)
 
@@ -297,7 +318,8 @@ class Trainer:
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CBCT Tooth & Canal Segmentation")
     parser.add_argument("--data_dir", type=str, default="./data")
-    parser.add_argument("--arch", type=str, default="swin_unetr", choices=["unet3d", "swin_unetr"])
+    parser.add_argument("--arch", type=str, default="nnunet",
+                        choices=["nnunet", "unet3d", "swin_unetr"])
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
