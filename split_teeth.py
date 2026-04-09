@@ -194,6 +194,114 @@ def extract_single_tooth(
     return cropped_image, cropped_label
 
 
+def find_teeth_from_image(
+    image: np.ndarray,
+    percentile_low: float = 60.0,
+    percentile_high: float = 99.5,
+    min_voxels: int = 5000,
+) -> Tuple[np.ndarray, int]:
+    """
+    Tìm các răng riêng lẻ từ CBCT image (không cần label).
+
+    Dùng intensity thresholding: răng (enamel/dentin) sáng hơn mô mềm.
+    Threshold = percentile_low của phần ảnh không phải nền (>0).
+
+    Args:
+        image: CBCT volume (float)
+        percentile_low: percentile ngưỡng dưới để phân ngưỡng (default 60%)
+        percentile_high: clip outlier trước khi threshold
+        min_voxels: ngưỡng tối thiểu để loại noise
+
+    Returns:
+        components: mảng 3D, mỗi răng có 1 integer index
+        num_teeth: số lượng răng tìm được
+    """
+    # Clip outliers rồi normalize về [0, 1]
+    p_low = np.percentile(image, 0.5)
+    p_high = np.percentile(image, percentile_high)
+    img_norm = np.clip(image, p_low, p_high)
+    img_norm = (img_norm - p_low) / (p_high - p_low + 1e-8)
+
+    # Threshold: chỉ giữ voxel sáng (răng) theo percentile_low
+    threshold = np.percentile(img_norm, percentile_low)
+    tooth_mask = (img_norm >= threshold).astype(np.uint8)
+
+    # Morphological closing để lấp khoang tủy (thường tối hơn enamel)
+    struct_close = ndimage.generate_binary_structure(3, 1)
+    tooth_mask = ndimage.binary_closing(tooth_mask, structure=struct_close, iterations=3).astype(np.uint8)
+
+    # Xóa connected component nền lớn nhất (background thường là component lớn nhất)
+    struct_cc = ndimage.generate_binary_structure(3, 1)
+    labeled_tmp, n_tmp = ndimage.label(tooth_mask, structure=struct_cc)
+    sizes = ndimage.sum(tooth_mask, labeled_tmp, range(1, n_tmp + 1))
+    # Xóa component lớn nhất (background nếu có)
+    if len(sizes) > 0:
+        biggest = np.argmax(sizes) + 1
+        tooth_mask[labeled_tmp == biggest] = 0
+
+    # CC lần 2 để phân tách các răng
+    labeled, num_found = ndimage.label(tooth_mask, structure=struct_cc)
+    component_sizes = ndimage.sum(tooth_mask, labeled, range(1, num_found + 1))
+    keep_mask = component_sizes >= min_voxels
+
+    new_labeled = np.zeros_like(labeled)
+    new_idx = 1
+    for i, keep in enumerate(keep_mask):
+        if keep:
+            new_labeled[labeled == (i + 1)] = new_idx
+            new_idx += 1
+
+    return new_labeled, new_idx - 1
+
+
+def process_case_inference(
+    image_path: str,
+    output_dir: str,
+    case_id: str,
+    margin: int = 15,
+    min_voxels: int = 5000,
+    percentile_threshold: float = 60.0,
+) -> int:
+    """
+    Tách CBCT thành các răng riêng lẻ CHỈ TỪ IMAGE (không cần label).
+    Dùng cho inference trên data mới chưa có annotation.
+
+    Returns:
+        Số lượng răng đã lưu
+    """
+    print(f"\n[{case_id}] Loading {image_path}")
+    image, affine, header = load_nifti(image_path)
+    print(f"  Volume shape: {image.shape}")
+
+    components, num_teeth = find_teeth_from_image(
+        image,
+        percentile_low=percentile_threshold,
+        min_voxels=min_voxels,
+    )
+    print(f"  Tìm thấy {num_teeth} răng")
+
+    if num_teeth == 0:
+        print(f"  [WARN] Không tìm thấy răng nào trong {case_id}")
+        return 0
+
+    out_img_dir = Path(output_dir) / "images"
+    out_img_dir.mkdir(parents=True, exist_ok=True)
+
+    for tooth_idx in range(1, num_teeth + 1):
+        this_tooth = (components == tooth_idx)
+        bbox = get_bounding_box(this_tooth, margin=margin)
+        if bbox is None:
+            continue
+
+        cropped_img = image[bbox].copy()
+        out_name = f"{case_id}_tooth{tooth_idx:02d}.nii.gz"
+        img_out = out_img_dir / out_name
+        save_nifti(cropped_img, affine, header, str(img_out), is_label=False)
+        print(f"  Răng {tooth_idx:02d}: shape={cropped_img.shape} -> {out_name}")
+
+    return num_teeth
+
+
 def process_case(
     image_path: str,
     label_path: str,
@@ -317,19 +425,55 @@ def parse_args():
                         help="Xử lý toàn bộ thư mục")
     parser.add_argument("--input_dir", type=str,
                         help="Thư mục chứa các file CBCT (dùng với --batch)")
+    parser.add_argument("--infer_only", action="store_true",
+                        help="Chỉ có image, không có label (dùng cho inference)")
+    parser.add_argument("--percentile_threshold", type=float, default=60.0,
+                        help="Percentile ngưỡng phân vùng răng (default=60, tăng nếu có nhiều noise)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    if args.batch:
+    if args.infer_only:
+        # Inference mode: không cần label
+        if args.batch:
+            if not args.input_dir:
+                raise ValueError("--batch yêu cầu --input_dir")
+            input_path = Path(args.input_dir)
+            all_files = sorted(
+                list(input_path.glob("*.nii.gz")) + list(input_path.glob("*.nii"))
+                + list(input_path.glob("*.nrrd"))
+            )
+            image_files = [f for f in all_files
+                           if "label" not in f.name.lower()
+                           and "mask" not in f.name.lower()
+                           and "seg" not in f.name.lower()
+                           and "pred" not in f.name.lower()]
+            total = 0
+            for img_file in image_files:
+                stem = img_file.name.replace(".nii.gz", "").replace(".nii", "").replace(".nrrd", "")
+                total += process_case_inference(
+                    str(img_file), args.output, stem,
+                    margin=args.margin, min_voxels=args.min_voxels,
+                    percentile_threshold=args.percentile_threshold,
+                )
+            print(f"\nTổng: {total} răng -> {args.output}/images/")
+        else:
+            if not args.image:
+                raise ValueError("--infer_only yêu cầu --image")
+            process_case_inference(
+                args.image, args.output, args.case_id,
+                margin=args.margin, min_voxels=args.min_voxels,
+                percentile_threshold=args.percentile_threshold,
+            )
+    elif args.batch:
         if not args.input_dir:
             raise ValueError("--batch yêu cầu --input_dir")
         batch_process(args.input_dir, args.output, args.margin, args.min_voxels)
     else:
         if not args.image or not args.label:
-            raise ValueError("Cần --image và --label (hoặc dùng --batch)")
+            raise ValueError("Cần --image và --label (hoặc dùng --batch hoặc --infer_only)")
         process_case(
             args.image, args.label, args.output, args.case_id,
             margin=args.margin, min_voxels=args.min_voxels,
