@@ -34,7 +34,7 @@ class Predictor:
 
         # Load model
         self.model = build_model(model_config, img_size=config.patch_size)
-        checkpoint = torch.load(config.checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(config.checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model = self.model.to(self.device)
         self.model.eval()

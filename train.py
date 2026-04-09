@@ -361,7 +361,7 @@ def main():
     # Resume from checkpoint
     if args.resume and os.path.exists(args.resume):
         print(f"Resuming from checkpoint: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=trainer.device)
+        ckpt = torch.load(args.resume, map_location=trainer.device, weights_only=False)
         trainer.model.load_state_dict(ckpt["model_state_dict"])
         trainer.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         trainer.best_val_dice = ckpt.get("best_val_dice", 0.0)
