@@ -38,38 +38,70 @@ def load_nifti(path: str) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
     return img.get_fdata(), img.affine, img.header
 
 
-def save_nifti(data: np.ndarray, affine: np.ndarray, header, path: str):
-    """Lưu numpy array thành NIfTI."""
-    img = nib.Nifti1Image(data.astype(np.float32), affine=affine, header=header)
+def save_nifti(
+    data: np.ndarray,
+    affine: np.ndarray,
+    header,
+    path: str,
+    is_label: bool = False,
+):
+    """
+    Lưu numpy array thành NIfTI.
+
+    Args:
+        is_label: nếu True, lưu dưới dạng uint8 (cho mask segmentation).
+                  Nếu False, lưu float32 (cho CBCT image).
+    """
+    if is_label:
+        # Mask phải là integer để 3D Slicer và MONAI đọc đúng
+        data_out = data.astype(np.uint8)
+        img = nib.Nifti1Image(data_out, affine=affine)
+        img.header.set_data_dtype(np.uint8)
+    else:
+        data_out = data.astype(np.float32)
+        img = nib.Nifti1Image(data_out, affine=affine, header=header)
+        img.header.set_data_dtype(np.float32)
     nib.save(img, path)
 
 
 def find_individual_teeth(
     label: np.ndarray,
     tooth_label: int = 1,
+    canal_label: int = 2,
     min_voxels: int = 5000,
 ) -> Tuple[np.ndarray, int]:
     """
     Phân tách các răng riêng lẻ bằng connected component analysis.
 
+    QUAN TRỌNG: Dùng UNION (tooth ∪ canal) làm "full tooth" mask để
+    connected component không bị vỡ bởi cấu trúc canal bên trong.
+    Nếu chỉ dùng label==1 (tooth shell), mask là lớp vỏ rỗng — CC
+    có thể bị ảnh hưởng và sau đó việc filter canal bằng dilation sẽ
+    bỏ sót phần pulp chamber ở giữa răng.
+
     Args:
         label: mask 3D (int)
-        tooth_label: giá trị label của răng (thường = 1)
+        tooth_label: label của tooth shell (thường = 1)
+        canal_label: label của canal (thường = 2)
         min_voxels: ngưỡng tối thiểu để loại bỏ noise / component nhỏ
 
     Returns:
-        components: mảng 3D cùng shape với label, mỗi răng có 1 số nguyên
+        components: mảng 3D cùng shape với label, mỗi răng (full volume)
+                    có 1 số nguyên index
         num_teeth: số lượng răng tìm được
     """
-    tooth_mask = (label == tooth_label).astype(np.uint8)
+    # Union của tooth + canal = toàn bộ thể tích răng (bao gồm khoang tuỷ)
+    full_tooth_mask = (
+        (label == tooth_label) | (label == canal_label)
+    ).astype(np.uint8)
 
     # Connectivity = 1 (6-connectivity) để tránh nối nhầm 2 răng
-    # gần nhau qua điểm góc. Có thể tăng lên 2 hoặc 3 nếu răng bị tách rời.
+    # gần nhau qua điểm góc
     structure = ndimage.generate_binary_structure(3, 1)
-    labeled, num_found = ndimage.label(tooth_mask, structure=structure)
+    labeled, num_found = ndimage.label(full_tooth_mask, structure=structure)
 
     # Lọc bỏ các component quá nhỏ (nhiễu)
-    component_sizes = ndimage.sum(tooth_mask, labeled, range(1, num_found + 1))
+    component_sizes = ndimage.sum(full_tooth_mask, labeled, range(1, num_found + 1))
     keep_mask = component_sizes >= min_voxels
 
     # Relabel: chỉ giữ components lớn
@@ -112,48 +144,52 @@ def extract_single_tooth(
     tooth_components: np.ndarray,
     tooth_idx: int,
     margin: int = 15,
+    tooth_label: int = 1,
     canal_label: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Trích xuất 1 răng riêng lẻ từ volume.
 
+    tooth_components đã chứa full tooth (tooth shell + canal) như 1 khối,
+    nên ta dùng trực tiếp thay vì phải dilation để bắt canal.
+
     Args:
         image: CBCT volume gốc
         label: mask gốc (0=bg, 1=tooth, 2=canal)
         tooth_components: mảng components từ find_individual_teeth
+                          (chứa full tooth volume, không chỉ shell)
         tooth_idx: index của răng cần trích xuất (1, 2, ..., num_teeth)
         margin: margin voxel quanh bounding box
+        tooth_label: label của tooth shell
         canal_label: label của canal
 
     Returns:
-        cropped_image, cropped_label (đã được làm sạch chỉ chứa 1 răng)
+        cropped_image (float32), cropped_label (uint8)
     """
-    # Tạo mask chỉ chứa răng hiện tại
-    this_tooth_mask = (tooth_components == tooth_idx)
+    # Full volume của răng hiện tại (tooth shell + canal bên trong)
+    this_full_tooth = (tooth_components == tooth_idx)
 
-    # Tính bounding box với margin
-    bbox = get_bounding_box(this_tooth_mask, margin=margin)
+    # Tính bounding box trên full volume → đảm bảo bao trọn cả crown
+    # lẫn root apex lẫn pulp chamber
+    bbox = get_bounding_box(this_full_tooth, margin=margin)
     if bbox is None:
         return None, None
 
-    # Crop image và label gốc
+    # Crop
     cropped_image = image[bbox].copy()
     cropped_label_full = label[bbox].copy()
-    cropped_tooth_mask = this_tooth_mask[bbox]
+    cropped_this_tooth = this_full_tooth[bbox]
 
-    # Làm sạch: chỉ giữ tooth + canal thuộc răng này
-    # (vì bounding box có thể chứa một phần của răng bên cạnh)
-    cropped_label = np.zeros_like(cropped_label_full)
+    # Tạo label mới: chỉ giữ voxels thuộc răng hiện tại
+    # (loại bỏ phần răng lân cận có thể lọt vào bbox)
+    cropped_label = np.zeros_like(cropped_label_full, dtype=np.uint8)
 
-    # Gán lại tooth (chỉ trong component của răng hiện tại)
-    cropped_label[cropped_tooth_mask] = 1
-
-    # Gán canal: chỉ những canal voxels nằm trong bounding box của răng này
-    # VÀ nằm bên trong (hoặc rất gần) răng hiện tại.
-    # Dùng dilation nhẹ của tooth mask để bao phủ canal chạm vào răng.
-    tooth_dilated = ndimage.binary_dilation(cropped_tooth_mask, iterations=2)
-    canal_mask = (cropped_label_full == canal_label) & tooth_dilated
-    cropped_label[canal_mask] = 2
+    # Copy lại label gốc (cả tooth shell và canal) BÊN TRONG component
+    # của răng hiện tại → không cần dilation, không mất voxels canal
+    tooth_voxels = cropped_this_tooth & (cropped_label_full == tooth_label)
+    canal_voxels = cropped_this_tooth & (cropped_label_full == canal_label)
+    cropped_label[tooth_voxels] = tooth_label
+    cropped_label[canal_voxels] = canal_label
 
     return cropped_image, cropped_label
 
@@ -215,8 +251,8 @@ def process_case(
         img_out = out_img_dir / out_name
         lbl_out = out_lbl_dir / out_name
 
-        save_nifti(cropped_img, affine, header, str(img_out))
-        save_nifti(cropped_lbl, affine, label_header, str(lbl_out))
+        save_nifti(cropped_img, affine, header, str(img_out), is_label=False)
+        save_nifti(cropped_lbl, affine, label_header, str(lbl_out), is_label=True)
 
         print(
             f"  Răng {tooth_idx:02d}: shape={cropped_img.shape} "
