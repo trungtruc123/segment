@@ -199,89 +199,152 @@ def find_teeth_from_image(
     percentile_low: float = 60.0,
     percentile_high: float = 99.5,
     min_voxels: int = 5000,
+    seed_percentile: float = 85.0,
 ) -> Tuple[np.ndarray, int]:
     """
     Tìm các răng riêng lẻ từ CBCT image (không cần label).
 
-    Chiến lược:
-        1. Otsu threshold tự động (robust hơn fixed percentile)
-        2. Binary fill_holes để lấp khoang tủy bên trong mỗi răng
-        3. Distance transform + watershed để tách răng dính nhau
-        4. Filter bỏ component nhỏ (noise)
+    Chiến lược 2-level threshold + marker-controlled watershed:
 
-    Dùng watershed thay vì closing+CC vì closing dễ merge 2 răng
-    sát nhau thành 1 khối, đặc biệt ở resolution thô sau downsample.
+        Vấn đề: các răng nằm sát nhau, phần ngà răng (dentin) cùng
+        intensity → threshold thông thường gộp 2-3 răng thành 1 khối.
+
+        Giải pháp:
+        1. THRESHOLD THẤP (Otsu) → mask toàn bộ răng (gồm dentin dính nhau)
+        2. THRESHOLD CAO (percentile ~85) → chỉ đỉnh men răng sáng nhất
+           → 6 đốm RỜI nhau (vì men răng ở bề mặt, không dính qua dentin)
+        3. CC trên mask CAO → 6 seeds (1 seed = 1 đỉnh men = 1 răng)
+        4. Distance transform trên mask THẤP
+        5. Watershed(-distance, markers=seeds, mask=mask_thấp)
+           → tách chính xác dọc khe hở giữa 2 răng dính nhau
 
     Args:
         image: CBCT volume (float) — có thể là bản đã downsample
         percentile_low: percentile ngưỡng dưới (fallback nếu Otsu fail)
         percentile_high: clip outlier trước khi threshold
         min_voxels: ngưỡng tối thiểu để loại noise
+        seed_percentile: percentile cho threshold CAO tạo seeds
+                         (mặc định 85 = top 15% sáng nhất ≈ men răng)
 
     Returns:
         components: mảng 3D, mỗi răng có 1 integer index
         num_teeth: số lượng răng tìm được
     """
     from skimage.segmentation import watershed
-    from skimage.feature import peak_local_max
 
-    # --- Normalize ---
+    # =================================================================
+    # 1. Normalize
+    # =================================================================
     p_low = np.percentile(image, 0.5)
     p_high = np.percentile(image, percentile_high)
     img_norm = np.clip(image, p_low, p_high)
     img_norm = (img_norm - p_low) / (p_high - p_low + 1e-8)
 
-    # --- Threshold: Otsu trên foreground voxels ---
-    # Otsu tự thích nghi tốt hơn percentile cố định
+    # =================================================================
+    # 2. Threshold THẤP (Otsu) → full tooth mask (bao gồm dentin dính)
+    # =================================================================
     try:
         from skimage.filters import threshold_otsu
-        # Chỉ tính Otsu trên voxels > 0 (bỏ nền đen)
         fg_vals = img_norm[img_norm > 0.01]
         if len(fg_vals) > 1000:
             otsu_t = threshold_otsu(fg_vals)
         else:
             otsu_t = np.percentile(img_norm, percentile_low)
-        print(f"    Otsu threshold: {otsu_t:.3f}")
     except ImportError:
         otsu_t = np.percentile(img_norm, percentile_low)
 
-    tooth_mask = (img_norm >= otsu_t).astype(np.uint8)
+    full_mask = (img_norm >= otsu_t).astype(np.uint8)
+    # Fill holes để lấp khoang tủy tối bên trong răng
+    full_mask = ndimage.binary_fill_holes(full_mask).astype(np.uint8)
+    print(f"    Otsu threshold: {otsu_t:.3f} → "
+          f"full_mask: {full_mask.sum():,} voxels")
 
-    # --- Fill holes per-slice (lấp khoang tủy tối bên trong răng) ---
-    # Dùng fill_holes thay vì closing → không merge 2 răng sát nhau
-    tooth_mask_filled = ndimage.binary_fill_holes(tooth_mask).astype(np.uint8)
+    # =================================================================
+    # 3. Threshold CAO → chỉ đỉnh men răng → seeds TÁCH RỜI
+    # =================================================================
+    # Men răng (enamel) là phần sáng nhất trong CBCT.
+    # Ở vùng tiếp xúc giữa 2 răng, men mỏng dần → threshold cao
+    # sẽ bẻ đứt cầu nối dentin → tạo ra các đốm rời cho từng răng.
+    high_t = np.percentile(img_norm, seed_percentile)
+    seed_mask = (img_norm >= high_t).astype(np.uint8)
+    print(f"    Seed threshold (p{seed_percentile:.0f}): {high_t:.3f} → "
+          f"seed_mask: {seed_mask.sum():,} voxels")
 
-    # --- Erosion nhẹ để đảm bảo tách răng dính nhau ---
-    struct_erode = ndimage.generate_binary_structure(3, 1)
-    erode_iters = max(1, min(3, int(min(image.shape) * 0.01)))
-    tooth_eroded = ndimage.binary_erosion(
-        tooth_mask_filled, structure=struct_erode, iterations=erode_iters
-    ).astype(np.uint8)
-
-    # --- CC trên mask đã erode để đếm số "seed" răng ---
+    # CC trên seed_mask → mỗi component = 1 seed = 1 răng
     struct_cc = ndimage.generate_binary_structure(3, 1)
-    seeds, n_seeds = ndimage.label(tooth_eroded, structure=struct_cc)
+    seed_labels, n_seeds = ndimage.label(seed_mask, structure=struct_cc)
+
+    # Bỏ seed quá nhỏ (noise) — giữ > 1% kích thước seed trung bình
+    if n_seeds > 0:
+        seed_sizes = ndimage.sum(seed_mask, seed_labels, range(1, n_seeds + 1))
+        median_seed_size = np.median(seed_sizes)
+        min_seed = max(10, median_seed_size * 0.05)
+        for i, sz in enumerate(seed_sizes):
+            if sz < min_seed:
+                seed_labels[seed_labels == (i + 1)] = 0
+        # Relabel
+        remaining = np.unique(seed_labels)
+        remaining = remaining[remaining > 0]
+        new_seeds = np.zeros_like(seed_labels)
+        for new_id, old_id in enumerate(remaining, 1):
+            new_seeds[seed_labels == old_id] = new_id
+        seed_labels = new_seeds
+        n_seeds = len(remaining)
+
+    print(f"    Seeds sau filter: {n_seeds}")
+
+    # =================================================================
+    # 4. Fallback: nếu threshold CAO cho quá ít seeds (< 2)
+    #    → tăng dần seed_percentile, hoặc dùng erosion progressive
+    # =================================================================
+    if n_seeds < 2:
+        print(f"    Seeds={n_seeds} < 2 → fallback: progressive erosion")
+        for erode_iter in range(1, 20):
+            eroded = ndimage.binary_erosion(
+                full_mask, structure=struct_cc, iterations=erode_iter
+            ).astype(np.uint8)
+            seed_labels, n_seeds = ndimage.label(eroded, structure=struct_cc)
+            # Bỏ component nhỏ
+            if n_seeds > 0:
+                esizes = ndimage.sum(eroded, seed_labels, range(1, n_seeds + 1))
+                min_es = max(5, np.median(esizes) * 0.05)
+                for i, sz in enumerate(esizes):
+                    if sz < min_es:
+                        seed_labels[seed_labels == (i + 1)] = 0
+                remaining = np.unique(seed_labels)
+                remaining = remaining[remaining > 0]
+                new_seeds = np.zeros_like(seed_labels)
+                for new_id, old_id in enumerate(remaining, 1):
+                    new_seeds[seed_labels == old_id] = new_id
+                seed_labels = new_seeds
+                n_seeds = len(remaining)
+            print(f"      Erosion {erode_iter}x → {n_seeds} seeds")
+            if n_seeds >= 2:
+                break
 
     if n_seeds == 0:
-        # Fallback: CC trên mask gốc (không erode)
-        seeds, n_seeds = ndimage.label(tooth_mask_filled, structure=struct_cc)
+        # Cuối cùng: CC trên full_mask (không tách được)
+        seed_labels, n_seeds = ndimage.label(full_mask, structure=struct_cc)
+        print(f"    Final fallback CC: {n_seeds} components")
 
     if n_seeds == 0:
         return np.zeros_like(image, dtype=np.int32), 0
 
-    print(f"    Seeds sau erosion ({erode_iters}x): {n_seeds} components")
+    # =================================================================
+    # 5. Watershed: dùng seeds làm markers, distance trên full_mask
+    # =================================================================
+    dist = ndimage.distance_transform_edt(full_mask)
+    labeled = watershed(-dist, markers=seed_labels, mask=full_mask)
 
-    # --- Distance transform + Watershed để tách chính xác ---
-    # Distance transform trên filled mask
-    dist = ndimage.distance_transform_edt(tooth_mask_filled)
+    # =================================================================
+    # 6. Filter bỏ component nhỏ
+    # =================================================================
+    max_label = labeled.max()
+    if max_label == 0:
+        return np.zeros_like(image, dtype=np.int32), 0
 
-    # Dùng seeds từ eroded mask làm markers cho watershed
-    # Watershed chạy trên -distance (tìm "valley" giữa 2 răng)
-    labeled = watershed(-dist, markers=seeds, mask=tooth_mask_filled)
-
-    # --- Filter bỏ component nhỏ ---
     component_sizes = ndimage.sum(
-        tooth_mask_filled, labeled, range(1, labeled.max() + 1)
+        full_mask, labeled, range(1, max_label + 1)
     )
 
     new_labeled = np.zeros_like(labeled)
@@ -292,7 +355,8 @@ def find_teeth_from_image(
             new_idx += 1
 
     num_teeth = new_idx - 1
-    print(f"    Sau filter (min_voxels={min_voxels}): {num_teeth} răng")
+    print(f"    Watershed → {max_label} regions → "
+          f"sau filter (min={min_voxels}): {num_teeth} răng")
     return new_labeled, num_teeth
 
 
