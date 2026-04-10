@@ -43,6 +43,8 @@ import torch
 import torch.nn.functional as F
 from monai.inferers import sliding_window_inference
 
+from scipy import ndimage as ndi
+
 from config import DataConfig, ModelConfig
 from model import build_model
 from split_teeth import find_teeth_from_image, get_bounding_box
@@ -173,17 +175,62 @@ def run(args):
     print(f"  Spacing: {orig_spacing}  (mm)")
 
     # --- Detect teeth ---
-    print("\n[1/3] Đang detect từng răng từ image...")
+    # Nếu spacing nhỏ (<0.2mm) → downsample về ~0.5mm để detect nhanh + chính xác hơn
+    # (ở resolution cao, morphological closing không đủ phủ khoang tủy,
+    #  và toàn bộ răng dễ merge thành 1 component bị xóa nhầm)
+    DETECT_SPACING = 0.5  # mm — đủ thô để tách răng, đủ mịn giữ biên
+    min_spacing = min(orig_spacing)
+    need_downsample = min_spacing < 0.2
+
+    print(f"\n[1/3] Đang detect từng răng từ image...")
     t0 = time.time()
-    components, num_teeth = find_teeth_from_image(
-        image,
-        percentile_low=args.percentile_threshold,
-        min_voxels=args.min_voxels,
-    )
+
+    if need_downsample:
+        downsample_factor = tuple(
+            DETECT_SPACING / s for s in orig_spacing
+        )
+        print(f"  Spacing {min_spacing:.4f}mm < 0.2mm → downsample {downsample_factor[0]:.1f}x "
+              f"về ~{DETECT_SPACING}mm để detect")
+        # Downsample bằng scipy zoom (order=1 = bilinear, nhanh)
+        image_ds = ndi.zoom(image, [1.0 / f for f in downsample_factor], order=1)
+        print(f"  Downsampled shape: {image_ds.shape}")
+
+        # Min_voxels scale theo tỉ lệ thể tích
+        vol_ratio = np.prod(downsample_factor)
+        min_voxels_ds = max(100, int(args.min_voxels / vol_ratio))
+
+        components_ds, num_teeth = find_teeth_from_image(
+            image_ds,
+            percentile_low=args.percentile_threshold,
+            min_voxels=min_voxels_ds,
+        )
+
+        # Upsample component map về resolution gốc (nearest neighbor giữ integer label)
+        components = ndi.zoom(
+            components_ds, downsample_factor, order=0  # order=0 = nearest
+        )
+        # Crop/pad nếu shape bị lệch 1 voxel do rounding
+        if components.shape != image.shape:
+            out = np.zeros(image.shape, dtype=components.dtype)
+            slices = tuple(slice(0, min(c, o)) for c, o in zip(components.shape, image.shape))
+            out[slices] = components[slices]
+            components = out
+    else:
+        components, num_teeth = find_teeth_from_image(
+            image,
+            percentile_low=args.percentile_threshold,
+            min_voxels=args.min_voxels,
+        )
+
     t_detect = time.time() - t0
     print(f"  Tìm thấy {num_teeth} răng trong {t_detect:.1f}s")
     if num_teeth == 0:
-        raise RuntimeError("Không detect được răng nào — chỉnh --percentile_threshold")
+        raise RuntimeError(
+            f"Không detect được răng nào.\n"
+            f"  Thử giảm --percentile_threshold (hiện={args.percentile_threshold}, "
+            f"thử 50 hoặc 40)\n"
+            f"  Hoặc giảm --min_voxels (hiện={args.min_voxels}, thử 1000)"
+        )
 
     # --- Inference từng răng + stitch ---
     print(f"\n[2/3] Inference từng răng + ghép lại...")
@@ -191,11 +238,16 @@ def run(args):
     target_spacing = tuple(args.target_spacing)
     patch_size = tuple(args.patch_size)
 
+    # Margin tính theo mm (mặc định ~5mm) rồi convert sang voxels
+    margin_mm = args.margin_mm
+    margin_voxels = max(5, int(round(margin_mm / min_spacing)))
+    print(f"  Margin: {margin_mm}mm = {margin_voxels} voxels (spacing={min_spacing:.4f}mm)")
+
     timings = []
     tooth_stats = []
     for tooth_idx in range(1, num_teeth + 1):
         this_tooth_mask = components == tooth_idx
-        bbox = get_bounding_box(this_tooth_mask, margin=args.margin)
+        bbox = get_bounding_box(this_tooth_mask, margin=margin_voxels)
         if bbox is None:
             continue
 
@@ -302,7 +354,9 @@ def parse_args():
 
     # Tooth detection
     parser.add_argument("--margin", type=int, default=15,
-                        help="Margin voxel quanh bbox răng")
+                        help="(deprecated, dùng --margin_mm) Margin voxel quanh bbox")
+    parser.add_argument("--margin_mm", type=float, default=5.0,
+                        help="Margin (mm) quanh bbox răng — tự convert sang voxels")
     parser.add_argument("--min_voxels", type=int, default=5000,
                         help="Min voxels để coi là 1 răng")
     parser.add_argument("--percentile_threshold", type=float, default=60.0,

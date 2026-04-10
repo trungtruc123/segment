@@ -227,20 +227,38 @@ def find_teeth_from_image(
     tooth_mask = (img_norm >= threshold).astype(np.uint8)
 
     # Morphological closing để lấp khoang tủy (thường tối hơn enamel)
+    # iterations scale theo resolution: ở 0.3mm cần 3, ở 0.08mm cần ~12
     struct_close = ndimage.generate_binary_structure(3, 1)
-    tooth_mask = ndimage.binary_closing(tooth_mask, structure=struct_close, iterations=3).astype(np.uint8)
+    close_iters = max(3, int(round(1.0 / max(0.01, image.shape[0] / 500))))
+    # Fallback đơn giản: luôn dùng 5 iterations (đủ cho mọi spacing)
+    close_iters = 5
+    tooth_mask = ndimage.binary_closing(
+        tooth_mask, structure=struct_close, iterations=close_iters
+    ).astype(np.uint8)
 
-    # Xóa connected component nền lớn nhất (background thường là component lớn nhất)
+    # Connected component analysis
     struct_cc = ndimage.generate_binary_structure(3, 1)
     labeled_tmp, n_tmp = ndimage.label(tooth_mask, structure=struct_cc)
-    sizes = ndimage.sum(tooth_mask, labeled_tmp, range(1, n_tmp + 1))
-    # Xóa component lớn nhất (background nếu có)
-    if len(sizes) > 0:
-        biggest = np.argmax(sizes) + 1
-        tooth_mask[labeled_tmp == biggest] = 0
 
-    # CC lần 2 để phân tách các răng
+    if n_tmp == 0:
+        return np.zeros_like(image, dtype=np.int32), 0
+
+    sizes = ndimage.sum(tooth_mask, labeled_tmp, range(1, n_tmp + 1))
+
+    # Xóa component quá lớn (>50% tổng foreground) — likely là bone/background
+    # chứ không phải răng riêng lẻ. Nhưng chỉ xóa nếu có ít nhất 2 component
+    # (tránh xóa nhầm khi chỉ có 1 răng)
+    total_fg = tooth_mask.sum()
+    if n_tmp > 1:
+        for i, sz in enumerate(sizes):
+            if sz > 0.5 * total_fg:
+                tooth_mask[labeled_tmp == (i + 1)] = 0
+
+    # CC lần 2 để phân tách các răng (sau khi bỏ bone/background lớn)
     labeled, num_found = ndimage.label(tooth_mask, structure=struct_cc)
+    if num_found == 0:
+        return np.zeros_like(image, dtype=np.int32), 0
+
     component_sizes = ndimage.sum(tooth_mask, labeled, range(1, num_found + 1))
     keep_mask = component_sizes >= min_voxels
 
