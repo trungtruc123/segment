@@ -204,7 +204,7 @@ def find_teeth_from_image(
     """
     Tìm các răng riêng lẻ từ CBCT image (không cần label).
 
-    Chiến lược: Otsu threshold + progressive erosion + watershed.
+    Chiến lược: Otsu + Distance Transform + peak_local_max + Watershed.
 
         Vấn đề: các răng nằm sát nhau, phần ngà răng (dentin) cùng
         intensity → threshold thông thường gộp 2-3 răng thành 1 khối.
@@ -212,13 +212,13 @@ def find_teeth_from_image(
         Giải pháp:
         1. Otsu threshold → full_mask (toàn bộ răng kể cả dentin dính)
         2. fill_holes → lấp khoang tủy tối bên trong
-        3. Progressive erosion: co full_mask dần từng lớp vào trong.
-           Cầu nối dentin mỏng giữa 2 răng sẽ đứt trước, lõi mỗi
-           răng vẫn còn nguyên → mỗi lõi = 1 seed.
-           Chọn mức erosion cho N seeds ổn định (không tăng khi erode thêm).
-        4. Watershed(-distance, markers=seeds, mask=full_mask)
-           → mở rộng seeds ra đúng biên tooth, tách ở valley giữa 2 răng.
-        5. Filter bỏ component nhỏ (noise).
+        3. Distance transform trên full_mask:
+           - Tâm mỗi răng: distance CAO (xa biên nhất, ~bán kính)
+           - Cầu nối dentin: distance THẤP (mỏng → gần biên cả 2 phía)
+        4. peak_local_max → tìm 1 đỉnh / răng (= tâm lõi)
+        5. Watershed(-distance, markers=peaks, mask=full_mask)
+           → mở rộng seeds ra đúng biên, tách ở valley giữa 2 răng.
+        6. Filter bỏ component nhỏ (noise).
 
     Args:
         image: CBCT volume (float) — có thể là bản đã downsample
@@ -261,99 +261,79 @@ def find_teeth_from_image(
           f"full_mask: {full_mask.sum():,} voxels")
 
     # =================================================================
-    # 3. Tạo seeds bằng progressive erosion trên full_mask
+    # 3. Tạo seeds bằng Distance Transform + peak_local_max
     # =================================================================
-    # Chiến lược: erode full_mask dần dần cho đến khi tách thành N
-    # components ỔN ĐỊNH (N không tăng thêm khi erode tiếp).
+    # Chiến lược:
+    #   - Distance transform: mỗi voxel = khoảng cách tới biên gần nhất
+    #   - TÂM mỗi răng có distance CAO (xa biên nhất, ~bán kính răng)
+    #   - CẦU NỐI dentin giữa 2 răng luôn có distance THẤP (mỏng →
+    #     gần biên cả 2 phía) → KHÔNG BAO GIỜ là peak
+    #   - peak_local_max(min_distance=X) tìm đúng 1 đỉnh / răng
+    #     nếu X ≈ nửa bán kính răng nhỏ nhất
     #
-    # Tại sao erosion tốt hơn threshold scanning:
-    #   - Threshold cao → giữ noise ở nhiều nơi → hàng trăm fragments
-    #   - Erosion từ full_mask → co đều từ biên vào → cầu nối dentin
-    #     mỏng giữa 2 răng bị đứt trước, lõi mỗi răng vẫn còn nguyên
-    #   - Khi erosion đủ sâu: mỗi răng còn 1 "lõi" rời → đó là seed
+    # Tại sao tốt hơn erosion:
+    #   - Erosion co ĐỀU mọi thứ → răng nhỏ biến mất trước khi bridge đứt
+    #   - Distance transform: bridge mỏng 1mm luôn có dist ~0.5mm,
+    #     trong khi tâm răng nhỏ nhất vẫn có dist ~2-3mm → luôn tách được
     #
-    # Detect ổn định: khi N giữ nguyên qua 3 lần erode liên tiếp
-    #   → đó là số răng thật (không phải noise tạm thời)
+    # Parameters:
+    #   min_distance: nửa bán kính răng nhỏ nhất (premolar ~3mm →
+    #                 ở 0.25mm spacing = 12 voxels)
+    #   threshold_abs: loại noise fragment (peak phải >= X voxels từ biên)
     # =================================================================
+    from skimage.feature import peak_local_max
+    from scipy.ndimage import gaussian_filter
+
     struct_cc = ndimage.generate_binary_structure(3, 1)
 
-    def _relabel(labels):
-        """Relabel liên tục 1,2,...,N."""
-        unique = np.unique(labels)
-        unique = unique[unique > 0]
-        new = np.zeros_like(labels)
-        for new_id, old_id in enumerate(unique, 1):
-            new[labels == old_id] = new_id
-        return new, len(unique)
+    # Distance transform
+    dist = ndimage.distance_transform_edt(full_mask)
 
-    # --- Estimate kích thước tối thiểu 1 răng ---
-    # Giả sử mỗi răng chiếm ít nhất 2% tổng foreground
-    total_fg = full_mask.sum()
-    min_seed_size = max(50, int(total_fg * 0.02))
-    print(f"    Min seed size: {min_seed_size} voxels "
-          f"(2% of {total_fg:,} foreground)")
+    # Smooth để tránh double-peak trên 1 răng (bề mặt gồ ghề)
+    dist_smooth = gaussian_filter(dist, sigma=2.0)
+    print(f"    Distance transform: max={dist.max():.1f} voxels")
 
-    # --- Progressive erosion ---
-    prev_n = 0
-    stable_count = 0  # đếm số lần N giữ nguyên liên tiếp
-    best_seeds = None
-    best_n = 0
-    best_iter = 0
+    # --- Tính min_distance adaptive theo volume ---
+    # Ước lượng bán kính răng trung bình:
+    #   total_fg / N_expected_teeth ≈ thể tích 1 răng
+    #   bán kính ≈ (3V / 4π)^(1/3)
+    # Dùng N=6 làm ước lượng ban đầu (dental CBCT thường 4-8 răng)
+    n_expected = 6
+    vol_per_tooth = full_mask.sum() / n_expected
+    est_radius = (3 * vol_per_tooth / (4 * np.pi)) ** (1.0 / 3.0)
+    # min_distance = ~40% bán kính (đủ nhỏ để không miss răng sát nhau,
+    #                                đủ lớn để không double-count)
+    min_dist = max(3, int(est_radius * 0.4))
+    # threshold_abs: peak phải ≥ 20% max_distance (loại fragment mỏng)
+    thresh_abs = max(2.0, dist.max() * 0.15)
+    print(f"    Est. tooth radius: {est_radius:.1f} voxels → "
+          f"min_distance={min_dist}, threshold_abs={thresh_abs:.1f}")
 
-    for erode_iter in range(1, 50):
-        eroded = ndimage.binary_erosion(
-            full_mask, structure=struct_cc, iterations=erode_iter
-        ).astype(np.uint8)
+    # Tìm peaks = tâm mỗi răng
+    coords = peak_local_max(
+        dist_smooth,
+        min_distance=min_dist,
+        threshold_abs=thresh_abs,
+        exclude_border=False,
+    )
+    n_seeds = len(coords)
+    print(f"    peak_local_max → {n_seeds} peaks")
 
-        if eroded.sum() == 0:
-            print(f"      Erosion {erode_iter}x → empty, stop")
-            break
+    # Tạo seed labels: mỗi peak = 1 marker point
+    seed_labels = np.zeros(full_mask.shape, dtype=np.int32)
+    for i, (z, y, x) in enumerate(coords, 1):
+        seed_labels[z, y, x] = i
 
-        labels, n = ndimage.label(eroded, structure=struct_cc)
-
-        # Bỏ component nhỏ hơn min_seed_size
-        if n > 0:
-            sizes = ndimage.sum(eroded, labels, range(1, n + 1))
-            for i, sz in enumerate(sizes):
-                if sz < min_seed_size:
-                    labels[labels == (i + 1)] = 0
-            labels, n = _relabel(labels)
-
-        # Track best (nhiều seeds nhất mà stable)
-        if n > best_n:
-            best_n = n
-            best_seeds = labels.copy()
-            best_iter = erode_iter
-            stable_count = 0
-        elif n == best_n and n > 0:
-            stable_count += 1
-        elif n < best_n and best_n > 0:
-            # N giảm → đã erode quá sâu, seeds bắt đầu biến mất
-            # → best_n là đáp án đúng
-            print(f"      Erosion {erode_iter}x → {n} seeds (giảm từ {best_n}) → stop")
-            break
-
-        if stable_count >= 3:
-            print(f"      Erosion {erode_iter}x → {n} seeds (stable 3x) → confirmed")
-            break
-
-    n_seeds = best_n
-    seed_labels = best_seeds if best_seeds is not None else np.zeros_like(full_mask, dtype=np.int32)
-    print(f"    Best: erosion {best_iter}x → {n_seeds} seeds")
-
-    # --- Fallback: nếu erosion không tách được ---
-    if n_seeds < 2:
-        print(f"    Seeds={n_seeds} < 2 → fallback: CC trên full_mask")
-        seed_labels, n_seeds = ndimage.label(full_mask, structure=struct_cc)
-        seed_labels, n_seeds = _relabel(seed_labels)
+    # Dilate seeds 1 voxel để watershed robust hơn (marker = small sphere)
+    if n_seeds > 0:
+        seed_labels = ndimage.maximum_filter(seed_labels, size=3)
 
     if n_seeds == 0:
         return np.zeros_like(image, dtype=np.int32), 0
 
     # =================================================================
-    # 5. Watershed: dùng seeds làm markers, distance trên full_mask
+    # 4. Watershed: mở rộng seeds ra toàn bộ full_mask
     # =================================================================
-    dist = ndimage.distance_transform_edt(full_mask)
     labeled = watershed(-dist, markers=seed_labels, mask=full_mask)
 
     # =================================================================
