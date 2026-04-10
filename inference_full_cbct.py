@@ -204,6 +204,7 @@ def run(args):
             percentile_low=args.percentile_threshold,
             min_voxels=min_voxels_ds,
             seed_percentile=args.seed_percentile,
+            num_expected=args.num_expected,
         )
 
         # Upsample component map về resolution gốc (nearest neighbor giữ integer label)
@@ -222,6 +223,7 @@ def run(args):
             percentile_low=args.percentile_threshold,
             min_voxels=args.min_voxels,
             seed_percentile=args.seed_percentile,
+            num_expected=args.num_expected,
         )
 
     t_detect = time.time() - t0
@@ -393,6 +395,9 @@ def parse_args():
     parser.add_argument("--seed_percentile", type=float, default=85.0,
                         help="Percentile CAO để tạo seed tách răng dính nhau "
                              "(85=top 15%% sáng nhất ≈ men răng, tăng nếu quá nhiều seed)")
+    parser.add_argument("--num_expected", type=int, default=6,
+                        help="Số răng mong đợi trong CBCT (default=6). "
+                             "Dùng để hướng dẫn thuật toán detect + merge.")
 
     return parser.parse_args()
 

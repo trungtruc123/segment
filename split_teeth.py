@@ -200,38 +200,42 @@ def find_teeth_from_image(
     percentile_high: float = 99.5,
     min_voxels: int = 5000,
     seed_percentile: float = 85.0,
+    num_expected: int = 6,
 ) -> Tuple[np.ndarray, int]:
     """
     Tìm các răng riêng lẻ từ CBCT image (không cần label).
 
-    Chiến lược: Otsu + Distance Transform + peak_local_max + Watershed.
+    Chiến lược: Dual-mask + Distance Transform + peak_local_max + Watershed
+    + post-merge regions nhỏ/gần nhau.
 
         Vấn đề: các răng nằm sát nhau, phần ngà răng (dentin) cùng
         intensity → threshold thông thường gộp 2-3 răng thành 1 khối.
 
         Giải pháp:
-        1. Otsu threshold → full_mask (toàn bộ răng kể cả dentin dính)
-        2. fill_holes → lấp khoang tủy tối bên trong
-        3. Distance transform trên full_mask:
-           - Tâm mỗi răng: distance CAO (xa biên nhất, ~bán kính)
-           - Cầu nối dentin: distance THẤP (mỏng → gần biên cả 2 phía)
-        4. peak_local_max → tìm 1 đỉnh / răng (= tâm lõi)
-        5. Watershed(-distance, markers=peaks, mask=full_mask)
-           → mở rộng seeds ra đúng biên, tách ở valley giữa 2 răng.
-        6. Filter bỏ component nhỏ (noise).
+        1. Otsu → full_mask (toàn bộ cấu trúc răng + bone)
+        2. tooth_mask (percentile 65 của foreground + opening mạnh):
+           chỉ giữ lõi cứng nhất (enamel + dentin core), cắt dentin bridges
+        3. Distance transform trên tooth_mask → peaks ở tâm mỗi răng
+        4. peak_local_max + plateau scan → tìm N ổn định
+        5. Watershed(-dist, seeds, full_mask) → mở rộng ra toàn biên
+        6. Post-merge: nếu N > expected, merge regions nhỏ vào neighbor gần nhất
+        7. Filter bỏ component nhỏ (noise)
 
     Args:
         image: CBCT volume (float) — có thể là bản đã downsample
         percentile_low: percentile ngưỡng dưới (fallback nếu Otsu fail)
         percentile_high: clip outlier trước khi threshold
         min_voxels: ngưỡng tối thiểu cho kết quả cuối (loại noise)
-        seed_percentile: (deprecated, không dùng — giữ cho backward compat)
+        seed_percentile: (deprecated — giữ cho backward compat)
+        num_expected: số răng mong đợi (default=6), dùng cho fallback + merge
 
     Returns:
         components: mảng 3D, mỗi răng có 1 integer index
         num_teeth: số lượng răng tìm được
     """
     from skimage.segmentation import watershed
+    from skimage.feature import peak_local_max
+    from scipy.ndimage import gaussian_filter
 
     # =================================================================
     # 1. Normalize
@@ -242,20 +246,8 @@ def find_teeth_from_image(
     img_norm = (img_norm - p_low) / (p_high - p_low + 1e-8)
 
     # =================================================================
-    # 2. Tạo 2 masks: TOOTH mask (cao) cho seeds, FULL mask cho watershed
+    # 2. Dual mask: FULL mask (Otsu) + TOOTH mask (cao hơn, opening mạnh)
     # =================================================================
-    # Vấn đề Otsu: bắt cả xương ổ răng (alveolar bone) cùng intensity
-    # với dentin → distance transform có peaks ở xương → nhiễu.
-    #
-    # Giải pháp: dùng 2 mức threshold:
-    #   - TOOTH mask (percentile 75): chỉ phần sáng nhất = enamel + dentin
-    #     → loại xương ổ (hơi tối hơn) → distance transform sạch
-    #   - FULL mask (Otsu, thấp hơn): bao gồm cả chân răng + dentin
-    #     → dùng cho watershed mở rộng seeds ra toàn bộ thể tích răng
-    # =================================================================
-    from skimage.feature import peak_local_max
-    from scipy.ndimage import gaussian_filter
-
     try:
         from skimage.filters import threshold_otsu
         fg_vals = img_norm[img_norm > 0.01]
@@ -263,56 +255,67 @@ def find_teeth_from_image(
     except ImportError:
         otsu_t = np.percentile(img_norm, percentile_low)
 
-    # FULL mask: Otsu → cho watershed (bao gồm toàn bộ cấu trúc răng)
+    # FULL mask: Otsu → bao gồm toàn bộ cấu trúc răng cho watershed
     full_mask = (img_norm >= otsu_t).astype(np.uint8)
     full_mask = ndimage.binary_fill_holes(full_mask).astype(np.uint8)
 
-    # TOOTH mask: percentile 75 → chỉ phần cứng nhất (enamel+dentin core)
-    # Loại xương ổ, mô mềm → distance transform chỉ có peaks ở lõi răng
-    tooth_t = np.percentile(img_norm[full_mask > 0], 50)  # median CỦA foreground
+    # TOOTH mask: percentile 65 CỦA foreground — cao hơn median (50) để
+    # loại alveolar bone (hơi tối hơn enamel+dentin), nhưng không quá cao
+    # (75-80) sẽ mất chân răng nhỏ
+    fg_intensities = img_norm[full_mask > 0]
+    tooth_t = np.percentile(fg_intensities, 65)
     tooth_mask = (img_norm >= tooth_t).astype(np.uint8)
     tooth_mask = ndimage.binary_fill_holes(tooth_mask).astype(np.uint8)
 
-    # Opening nhẹ trên tooth_mask để cắt cầu nối mỏng giữa răng
-    struct_open = ndimage.generate_binary_structure(3, 1)
+    # Opening MẠNH trên tooth_mask: dùng connectivity=2 (18-connected, lớn hơn)
+    # + 3 iterations để cắt dentin bridges mỏng giữa các răng
+    struct_open = ndimage.generate_binary_structure(3, 2)  # 18-connectivity
     tooth_mask = ndimage.binary_opening(
-        tooth_mask, structure=struct_open, iterations=2
+        tooth_mask, structure=struct_open, iterations=3
     ).astype(np.uint8)
 
+    # Nếu opening quá mạnh xoá hết, fallback: giảm iterations
+    if tooth_mask.sum() < full_mask.sum() * 0.05:
+        print(f"    [WARN] Opening quá mạnh, fallback iterations=1")
+        tooth_mask = (img_norm >= tooth_t).astype(np.uint8)
+        tooth_mask = ndimage.binary_fill_holes(tooth_mask).astype(np.uint8)
+        struct_open_light = ndimage.generate_binary_structure(3, 1)
+        tooth_mask = ndimage.binary_opening(
+            tooth_mask, structure=struct_open_light, iterations=2
+        ).astype(np.uint8)
+
     print(f"    Otsu: {otsu_t:.3f} → full_mask: {full_mask.sum():,} vx")
-    print(f"    Tooth: {tooth_t:.3f} → tooth_mask: {tooth_mask.sum():,} vx")
+    print(f"    Tooth (p65): {tooth_t:.3f} → tooth_mask: {tooth_mask.sum():,} vx "
+          f"(ratio={tooth_mask.sum()/max(full_mask.sum(),1)*100:.1f}%)")
 
     # =================================================================
     # 3. Distance Transform trên TOOTH mask + peak_local_max
     # =================================================================
-    struct_cc = ndimage.generate_binary_structure(3, 1)
-
-    # Distance transform trên tooth_mask (không phải full_mask!)
-    # → peaks chỉ ở lõi răng, không ở xương
     dist = ndimage.distance_transform_edt(tooth_mask)
 
-    # Smooth mạnh: sigma = 3 voxels (tương đương ~0.75mm ở 0.25mm spacing)
-    # Đủ lớn để merge double-peaks trên 1 răng, đủ nhỏ để giữ 2 peaks 2 răng sát
+    # Smooth: sigma=3.0 voxels (~0.75mm ở 0.25mm spacing)
+    # Đủ để merge double-peaks trên 1 răng, giữ 2 peaks giữa 2 răng sát nhau
     sigma = 3.0
     dist_smooth = gaussian_filter(dist, sigma=sigma)
     max_dist = dist.max()
     print(f"    Distance transform: max={max_dist:.1f} vx, sigma={sigma:.1f}")
 
-    # threshold_abs CAO: peak phải cách biên ≥ 25% max_distance
-    # → loại sạch fragment nhỏ, xương mỏng, noise
-    # Ở downsample (161³): max_dist ~15-20 → thresh ~4-5 vx
-    # = chỉ giữ peaks sâu ít nhất 1mm bên trong cấu trúc
-    thresh_abs = max(3.0, max_dist * 0.25)
+    if max_dist < 2.0:
+        print(f"    [WARN] max_dist quá nhỏ ({max_dist:.1f}), không tìm được peaks")
+        return np.zeros_like(image, dtype=np.int32), 0
+
+    # threshold_abs: peak phải cách biên ≥ 20% max_distance (giảm từ 25%
+    # để không bỏ sót răng nhỏ — sẽ dùng post-merge để loại noise thay thế)
+    thresh_abs = max(2.5, max_dist * 0.20)
 
     # =================================================================
     # Scan min_distance: tìm PLATEAU cho N peaks ổn định
     # =================================================================
-    # Dental CBCT FOV nhỏ: thường 3-8 răng.
-    EXPECTED_MIN = 2
-    EXPECTED_MAX = 10
+    EXPECTED_MIN = max(2, num_expected - 3)
+    EXPECTED_MAX = num_expected + 4
 
-    md_max = max(5, int(max_dist * 0.6))
-    md_min = max(2, int(max_dist * 0.1))
+    md_max = max(5, int(max_dist * 0.7))
+    md_min = max(2, int(max_dist * 0.08))
     scan_results = []
 
     for md in range(md_max, md_min - 1, -1):
@@ -325,43 +328,65 @@ def find_teeth_from_image(
         n = len(coords_tmp)
         scan_results.append((md, n, coords_tmp))
 
-    # Tìm plateau: N giữ nguyên qua ≥3 bước liên tiếp
-    best_md = None
-    best_n = 0
-    best_coords = None
-
-    for i in range(len(scan_results) - 2):
-        md_i, n_i, c_i = scan_results[i]
-        _, n_i1, _ = scan_results[i + 1]
-        _, n_i2, _ = scan_results[i + 2]
-        if (EXPECTED_MIN <= n_i <= EXPECTED_MAX
-                and n_i == n_i1 == n_i2):
-            best_md = md_i
-            best_n = n_i
-            best_coords = c_i
-            break
-
-    # Fallback: chọn N gần expected nhất (ưu tiên 6)
-    if best_coords is None:
-        valid = [(md, n, c) for md, n, c in scan_results
-                 if EXPECTED_MIN <= n <= EXPECTED_MAX]
-        if valid:
-            valid.sort(key=lambda x: (abs(x[1] - 6), -x[0]))
-            best_md, best_n, best_coords = valid[0]
-        else:
-            valid_any = [(md, n, c) for md, n, c in scan_results if n >= 2]
-            if valid_any:
-                valid_any.sort(key=lambda x: (x[1], -x[0]))
-                best_md, best_n, best_coords = valid_any[0]
-
-    # Log
+    # Log scan results
     unique_ns = []
     for md, n, _ in scan_results:
         if not unique_ns or unique_ns[-1][1] != n:
             unique_ns.append((md, n))
-    print(f"    Scan: {', '.join(f'md={md}→{n}' for md, n in unique_ns[:12])}")
+    print(f"    Scan: {', '.join(f'md={md}→{n}' for md, n in unique_ns[:15])}")
+
+    # --- Tìm plateau: N giữ nguyên qua ≥3 bước liên tiếp ---
+    best_md = None
+    best_n = 0
+    best_coords = None
+
+    # Pass 1: tìm plateau CHÍNH XÁC num_expected
+    for i in range(len(scan_results) - 2):
+        md_i, n_i, c_i = scan_results[i]
+        _, n_i1, _ = scan_results[i + 1]
+        _, n_i2, _ = scan_results[i + 2]
+        if n_i == num_expected and n_i == n_i1 == n_i2:
+            best_md, best_n, best_coords = md_i, n_i, c_i
+            break
+
+    # Pass 2: tìm plateau bất kỳ trong [EXPECTED_MIN, EXPECTED_MAX]
+    if best_coords is None:
+        for i in range(len(scan_results) - 2):
+            md_i, n_i, c_i = scan_results[i]
+            _, n_i1, _ = scan_results[i + 1]
+            _, n_i2, _ = scan_results[i + 2]
+            if (EXPECTED_MIN <= n_i <= EXPECTED_MAX
+                    and n_i == n_i1 == n_i2):
+                best_md, best_n, best_coords = md_i, n_i, c_i
+                break
+
+    # Pass 3: tìm plateau ngắn hơn (≥2 bước liên tiếp)
+    if best_coords is None:
+        for i in range(len(scan_results) - 1):
+            md_i, n_i, c_i = scan_results[i]
+            _, n_i1, _ = scan_results[i + 1]
+            if (EXPECTED_MIN <= n_i <= EXPECTED_MAX
+                    and n_i == n_i1):
+                best_md, best_n, best_coords = md_i, n_i, c_i
+                break
+
+    # Fallback: chọn N gần num_expected nhất
+    if best_coords is None:
+        valid = [(md, n, c) for md, n, c in scan_results
+                 if EXPECTED_MIN <= n <= EXPECTED_MAX]
+        if valid:
+            # Ưu tiên: |N - num_expected| nhỏ nhất, sau đó md lớn nhất (ít peaks hơn = sạch hơn)
+            valid.sort(key=lambda x: (abs(x[1] - num_expected), -x[0]))
+            best_md, best_n, best_coords = valid[0]
+        else:
+            # Không có gì trong range → chọn N nhỏ nhất ≥ 2
+            valid_any = [(md, n, c) for md, n, c in scan_results if n >= 2]
+            if valid_any:
+                valid_any.sort(key=lambda x: (abs(x[1] - num_expected), -x[0]))
+                best_md, best_n, best_coords = valid_any[0]
+
     print(f"    → Best: min_distance={best_md}, peaks={best_n}, "
-          f"thresh_abs={thresh_abs:.1f}")
+          f"thresh_abs={thresh_abs:.1f}, expected={num_expected}")
 
     if best_coords is None or best_n == 0:
         return np.zeros_like(image, dtype=np.int32), 0
@@ -369,42 +394,100 @@ def find_teeth_from_image(
     coords = best_coords
     n_seeds = best_n
 
-    # Tạo seed labels (dùng cho watershed trên FULL mask)
+    # =================================================================
+    # 4. Tạo seed markers + Watershed trên FULL mask
+    # =================================================================
     seed_labels = np.zeros(full_mask.shape, dtype=np.int32)
     for i, (z, y, x) in enumerate(coords, 1):
         seed_labels[z, y, x] = i
-    # Dilate seeds nhẹ để watershed stable
+    # Dilate seeds nhẹ (3³ cube) để watershed khởi đầu ổn định
     seed_labels = ndimage.maximum_filter(seed_labels, size=3)
 
-    if n_seeds == 0:
-        return np.zeros_like(image, dtype=np.int32), 0
-
-    # =================================================================
-    # 4. Watershed: mở rộng seeds ra toàn bộ full_mask
-    # =================================================================
+    # Watershed: dùng -dist (valley ở biên giữa 2 răng) trên full_mask
     labeled = watershed(-dist, markers=seed_labels, mask=full_mask)
 
     # =================================================================
-    # 6. Filter bỏ component nhỏ
+    # 5. Post-merge: nếu quá nhiều regions, merge nhỏ vào neighbor gần nhất
     # =================================================================
     max_label = labeled.max()
     if max_label == 0:
         return np.zeros_like(image, dtype=np.int32), 0
 
-    component_sizes = ndimage.sum(
-        full_mask, labeled, range(1, max_label + 1)
-    )
+    # Tính size và centroid cho mỗi region
+    region_sizes = np.array([
+        int((labeled == lbl).sum()) for lbl in range(1, max_label + 1)
+    ])
+    region_centroids = np.array([
+        np.mean(np.argwhere(labeled == lbl), axis=0)
+        for lbl in range(1, max_label + 1)
+    ])
 
+    # Merge: nếu N > num_expected, merge region nhỏ nhất vào neighbor gần nhất
+    # cho đến khi N = num_expected hoặc không còn region nhỏ
+    current_labels = list(range(max_label))  # 0-indexed: region i+1
+    merge_map = {i: i for i in range(max_label)}  # track merges
+
+    median_size = np.median(region_sizes[region_sizes >= min_voxels]) if np.any(region_sizes >= min_voxels) else np.median(region_sizes)
+    # Region "nhỏ" = < 30% median size — likely noise/fragment
+    small_threshold = median_size * 0.30
+
+    n_valid = sum(1 for sz in region_sizes if sz >= min_voxels)
+    while n_valid > num_expected:
+        # Tìm region nhỏ nhất trong các valid regions
+        valid_idxs = [i for i in range(max_label)
+                      if region_sizes[i] >= min_voxels and merge_map[i] == i]
+        if len(valid_idxs) <= num_expected:
+            break
+        smallest_idx = min(valid_idxs, key=lambda i: region_sizes[i])
+        if region_sizes[smallest_idx] > small_threshold:
+            break  # Tất cả regions đều đủ lớn, stop merge
+
+        # Tìm neighbor gần nhất (theo centroid distance)
+        min_dist_val = float("inf")
+        nearest_idx = -1
+        for j in valid_idxs:
+            if j == smallest_idx:
+                continue
+            d = np.linalg.norm(region_centroids[smallest_idx] - region_centroids[j])
+            if d < min_dist_val:
+                min_dist_val = d
+                nearest_idx = j
+
+        if nearest_idx < 0:
+            break
+
+        # Merge: gộp smallest vào nearest
+        labeled[labeled == (smallest_idx + 1)] = nearest_idx + 1
+        region_sizes[nearest_idx] += region_sizes[smallest_idx]
+        # Update centroid (weighted average)
+        w1 = region_sizes[nearest_idx] - region_sizes[smallest_idx]
+        w2 = region_sizes[smallest_idx]
+        region_centroids[nearest_idx] = (
+            region_centroids[nearest_idx] * w1 + region_centroids[smallest_idx] * w2
+        ) / (w1 + w2 + 1e-8)
+        region_sizes[smallest_idx] = 0
+        merge_map[smallest_idx] = nearest_idx
+
+        n_valid = sum(1 for i in range(max_label)
+                      if region_sizes[i] >= min_voxels and merge_map[i] == i)
+        print(f"    [Merge] region {smallest_idx+1} ({region_sizes[smallest_idx]:,}vx) "
+              f"→ region {nearest_idx+1}, remaining={n_valid}")
+
+    # =================================================================
+    # 6. Filter bỏ component nhỏ + relabel liên tục
+    # =================================================================
+    unique_labels = sorted(set(labeled[labeled > 0]))
     new_labeled = np.zeros_like(labeled)
     new_idx = 1
-    for i, sz in enumerate(component_sizes):
+    for lbl in unique_labels:
+        sz = int((labeled == lbl).sum())
         if sz >= min_voxels:
-            new_labeled[labeled == (i + 1)] = new_idx
+            new_labeled[labeled == lbl] = new_idx
             new_idx += 1
 
     num_teeth = new_idx - 1
-    print(f"    Watershed → {max_label} regions → "
-          f"sau filter (min={min_voxels}): {num_teeth} răng")
+    print(f"    Watershed → {max_label} regions → merge → "
+          f"filter (min={min_voxels}): {num_teeth} răng")
     return new_labeled, num_teeth
 
 
