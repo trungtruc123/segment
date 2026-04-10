@@ -204,27 +204,28 @@ def find_teeth_from_image(
     """
     Tìm các răng riêng lẻ từ CBCT image (không cần label).
 
-    Chiến lược 2-level threshold + marker-controlled watershed:
+    Chiến lược: Otsu threshold + progressive erosion + watershed.
 
         Vấn đề: các răng nằm sát nhau, phần ngà răng (dentin) cùng
         intensity → threshold thông thường gộp 2-3 răng thành 1 khối.
 
         Giải pháp:
-        1. THRESHOLD THẤP (Otsu) → mask toàn bộ răng (gồm dentin dính nhau)
-        2. THRESHOLD CAO (percentile ~85) → chỉ đỉnh men răng sáng nhất
-           → 6 đốm RỜI nhau (vì men răng ở bề mặt, không dính qua dentin)
-        3. CC trên mask CAO → 6 seeds (1 seed = 1 đỉnh men = 1 răng)
-        4. Distance transform trên mask THẤP
-        5. Watershed(-distance, markers=seeds, mask=mask_thấp)
-           → tách chính xác dọc khe hở giữa 2 răng dính nhau
+        1. Otsu threshold → full_mask (toàn bộ răng kể cả dentin dính)
+        2. fill_holes → lấp khoang tủy tối bên trong
+        3. Progressive erosion: co full_mask dần từng lớp vào trong.
+           Cầu nối dentin mỏng giữa 2 răng sẽ đứt trước, lõi mỗi
+           răng vẫn còn nguyên → mỗi lõi = 1 seed.
+           Chọn mức erosion cho N seeds ổn định (không tăng khi erode thêm).
+        4. Watershed(-distance, markers=seeds, mask=full_mask)
+           → mở rộng seeds ra đúng biên tooth, tách ở valley giữa 2 răng.
+        5. Filter bỏ component nhỏ (noise).
 
     Args:
         image: CBCT volume (float) — có thể là bản đã downsample
         percentile_low: percentile ngưỡng dưới (fallback nếu Otsu fail)
         percentile_high: clip outlier trước khi threshold
-        min_voxels: ngưỡng tối thiểu để loại noise
-        seed_percentile: percentile cho threshold CAO tạo seeds
-                         (mặc định 85 = top 15% sáng nhất ≈ men răng)
+        min_voxels: ngưỡng tối thiểu cho kết quả cuối (loại noise)
+        seed_percentile: (deprecated, không dùng — giữ cho backward compat)
 
     Returns:
         components: mảng 3D, mỗi răng có 1 integer index
@@ -260,71 +261,91 @@ def find_teeth_from_image(
           f"full_mask: {full_mask.sum():,} voxels")
 
     # =================================================================
-    # 3. Tạo seeds: ADAPTIVE threshold + progressive erosion
+    # 3. Tạo seeds bằng progressive erosion trên full_mask
     # =================================================================
-    # Bước 3a: Tăng dần threshold từ seed_percentile lên 99
-    #   để tìm mức mà men răng tách rời thành N đốm riêng biệt.
-    #   Ở mỗi mức, đếm CC. Chọn mức có nhiều seeds nhất (= nhiều răng nhất)
-    #   mà mỗi seed đủ lớn (không phải noise).
-    # Bước 3b: Nếu vẫn < 2 seeds → progressive erosion trên full_mask.
+    # Chiến lược: erode full_mask dần dần cho đến khi tách thành N
+    # components ỔN ĐỊNH (N không tăng thêm khi erode tiếp).
+    #
+    # Tại sao erosion tốt hơn threshold scanning:
+    #   - Threshold cao → giữ noise ở nhiều nơi → hàng trăm fragments
+    #   - Erosion từ full_mask → co đều từ biên vào → cầu nối dentin
+    #     mỏng giữa 2 răng bị đứt trước, lõi mỗi răng vẫn còn nguyên
+    #   - Khi erosion đủ sâu: mỗi răng còn 1 "lõi" rời → đó là seed
+    #
+    # Detect ổn định: khi N giữ nguyên qua 3 lần erode liên tiếp
+    #   → đó là số răng thật (không phải noise tạm thời)
     # =================================================================
     struct_cc = ndimage.generate_binary_structure(3, 1)
 
-    def _count_seeds(mask, min_seed_size=10):
-        """CC trên mask, bỏ component nhỏ, trả (labels, n)."""
-        labels, n = ndimage.label(mask, structure=struct_cc)
-        if n == 0:
-            return labels, 0
-        sizes = ndimage.sum(mask, labels, range(1, n + 1))
-        med = np.median(sizes) if len(sizes) > 0 else 0
-        cutoff = max(min_seed_size, med * 0.05)
-        for i, sz in enumerate(sizes):
-            if sz < cutoff:
-                labels[labels == (i + 1)] = 0
-        remaining = np.unique(labels)
-        remaining = remaining[remaining > 0]
-        new_labels = np.zeros_like(labels)
-        for new_id, old_id in enumerate(remaining, 1):
-            new_labels[labels == old_id] = new_id
-        return new_labels, len(remaining)
+    def _relabel(labels):
+        """Relabel liên tục 1,2,...,N."""
+        unique = np.unique(labels)
+        unique = unique[unique > 0]
+        new = np.zeros_like(labels)
+        for new_id, old_id in enumerate(unique, 1):
+            new[labels == old_id] = new_id
+        return new, len(unique)
 
-    # 3a. Thử nhiều percentile từ seed_percentile → 99
+    # --- Estimate kích thước tối thiểu 1 răng ---
+    # Giả sử mỗi răng chiếm ít nhất 2% tổng foreground
+    total_fg = full_mask.sum()
+    min_seed_size = max(50, int(total_fg * 0.02))
+    print(f"    Min seed size: {min_seed_size} voxels "
+          f"(2% of {total_fg:,} foreground)")
+
+    # --- Progressive erosion ---
+    prev_n = 0
+    stable_count = 0  # đếm số lần N giữ nguyên liên tiếp
+    best_seeds = None
     best_n = 0
-    best_labels = None
-    best_pct = seed_percentile
-    candidates = np.arange(seed_percentile, 99.5, 2.0)  # [85, 87, 89, ..., 99]
-    print(f"    Scanning seed thresholds: p{candidates[0]:.0f} → p{candidates[-1]:.0f}")
-    for pct in candidates:
-        t = np.percentile(img_norm, pct)
-        smask = (img_norm >= t).astype(np.uint8)
-        slabels, sn = _count_seeds(smask)
-        if sn > best_n:
-            best_n = sn
-            best_labels = slabels
-            best_pct = pct
-    seed_labels = best_labels if best_labels is not None else np.zeros_like(img_norm, dtype=np.int32)
+    best_iter = 0
+
+    for erode_iter in range(1, 50):
+        eroded = ndimage.binary_erosion(
+            full_mask, structure=struct_cc, iterations=erode_iter
+        ).astype(np.uint8)
+
+        if eroded.sum() == 0:
+            print(f"      Erosion {erode_iter}x → empty, stop")
+            break
+
+        labels, n = ndimage.label(eroded, structure=struct_cc)
+
+        # Bỏ component nhỏ hơn min_seed_size
+        if n > 0:
+            sizes = ndimage.sum(eroded, labels, range(1, n + 1))
+            for i, sz in enumerate(sizes):
+                if sz < min_seed_size:
+                    labels[labels == (i + 1)] = 0
+            labels, n = _relabel(labels)
+
+        # Track best (nhiều seeds nhất mà stable)
+        if n > best_n:
+            best_n = n
+            best_seeds = labels.copy()
+            best_iter = erode_iter
+            stable_count = 0
+        elif n == best_n and n > 0:
+            stable_count += 1
+        elif n < best_n and best_n > 0:
+            # N giảm → đã erode quá sâu, seeds bắt đầu biến mất
+            # → best_n là đáp án đúng
+            print(f"      Erosion {erode_iter}x → {n} seeds (giảm từ {best_n}) → stop")
+            break
+
+        if stable_count >= 3:
+            print(f"      Erosion {erode_iter}x → {n} seeds (stable 3x) → confirmed")
+            break
+
     n_seeds = best_n
-    high_t = np.percentile(img_norm, best_pct)
-    print(f"    Best seed threshold: p{best_pct:.0f} (={high_t:.3f}) → {n_seeds} seeds")
+    seed_labels = best_seeds if best_seeds is not None else np.zeros_like(full_mask, dtype=np.int32)
+    print(f"    Best: erosion {best_iter}x → {n_seeds} seeds")
 
-    # 3b. Nếu vẫn < 2 → progressive erosion trên full_mask
+    # --- Fallback: nếu erosion không tách được ---
     if n_seeds < 2:
-        print(f"    Seeds={n_seeds} < 2 → fallback: progressive erosion")
-        for erode_iter in range(1, 30):
-            eroded = ndimage.binary_erosion(
-                full_mask, structure=struct_cc, iterations=erode_iter
-            ).astype(np.uint8)
-            seed_labels, n_seeds = _count_seeds(eroded)
-            if n_seeds >= 2:
-                print(f"      Erosion {erode_iter}x → {n_seeds} seeds ✓")
-                break
-            elif eroded.sum() == 0:
-                print(f"      Erosion {erode_iter}x → mask empty, stop")
-                break
-
-    if n_seeds == 0:
+        print(f"    Seeds={n_seeds} < 2 → fallback: CC trên full_mask")
         seed_labels, n_seeds = ndimage.label(full_mask, structure=struct_cc)
-        print(f"    Final fallback CC: {n_seeds} components")
+        seed_labels, n_seeds = _relabel(seed_labels)
 
     if n_seeds == 0:
         return np.zeros_like(image, dtype=np.int32), 0
