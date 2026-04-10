@@ -178,7 +178,7 @@ def run(args):
     # Nếu spacing nhỏ (<0.2mm) → downsample về ~0.5mm để detect nhanh + chính xác hơn
     # (ở resolution cao, morphological closing không đủ phủ khoang tủy,
     #  và toàn bộ răng dễ merge thành 1 component bị xóa nhầm)
-    DETECT_SPACING = 0.5  # mm — đủ thô để tách răng, đủ mịn giữ biên
+    DETECT_SPACING = 0.25  # mm — downsample cho detect nhanh nhưng giữ biên
     min_spacing = min(orig_spacing)
     need_downsample = min_spacing < 0.2
 

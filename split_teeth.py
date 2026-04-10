@@ -203,12 +203,18 @@ def find_teeth_from_image(
     """
     Tìm các răng riêng lẻ từ CBCT image (không cần label).
 
-    Dùng intensity thresholding: răng (enamel/dentin) sáng hơn mô mềm.
-    Threshold = percentile_low của phần ảnh không phải nền (>0).
+    Chiến lược:
+        1. Otsu threshold tự động (robust hơn fixed percentile)
+        2. Binary fill_holes để lấp khoang tủy bên trong mỗi răng
+        3. Distance transform + watershed để tách răng dính nhau
+        4. Filter bỏ component nhỏ (noise)
+
+    Dùng watershed thay vì closing+CC vì closing dễ merge 2 răng
+    sát nhau thành 1 khối, đặc biệt ở resolution thô sau downsample.
 
     Args:
-        image: CBCT volume (float)
-        percentile_low: percentile ngưỡng dưới để phân ngưỡng (default 60%)
+        image: CBCT volume (float) — có thể là bản đã downsample
+        percentile_low: percentile ngưỡng dưới (fallback nếu Otsu fail)
         percentile_high: clip outlier trước khi threshold
         min_voxels: ngưỡng tối thiểu để loại noise
 
@@ -216,60 +222,78 @@ def find_teeth_from_image(
         components: mảng 3D, mỗi răng có 1 integer index
         num_teeth: số lượng răng tìm được
     """
-    # Clip outliers rồi normalize về [0, 1]
+    from skimage.segmentation import watershed
+    from skimage.feature import peak_local_max
+
+    # --- Normalize ---
     p_low = np.percentile(image, 0.5)
     p_high = np.percentile(image, percentile_high)
     img_norm = np.clip(image, p_low, p_high)
     img_norm = (img_norm - p_low) / (p_high - p_low + 1e-8)
 
-    # Threshold: chỉ giữ voxel sáng (răng) theo percentile_low
-    threshold = np.percentile(img_norm, percentile_low)
-    tooth_mask = (img_norm >= threshold).astype(np.uint8)
+    # --- Threshold: Otsu trên foreground voxels ---
+    # Otsu tự thích nghi tốt hơn percentile cố định
+    try:
+        from skimage.filters import threshold_otsu
+        # Chỉ tính Otsu trên voxels > 0 (bỏ nền đen)
+        fg_vals = img_norm[img_norm > 0.01]
+        if len(fg_vals) > 1000:
+            otsu_t = threshold_otsu(fg_vals)
+        else:
+            otsu_t = np.percentile(img_norm, percentile_low)
+        print(f"    Otsu threshold: {otsu_t:.3f}")
+    except ImportError:
+        otsu_t = np.percentile(img_norm, percentile_low)
 
-    # Morphological closing để lấp khoang tủy (thường tối hơn enamel)
-    # iterations scale theo resolution: ở 0.3mm cần 3, ở 0.08mm cần ~12
-    struct_close = ndimage.generate_binary_structure(3, 1)
-    close_iters = max(3, int(round(1.0 / max(0.01, image.shape[0] / 500))))
-    # Fallback đơn giản: luôn dùng 5 iterations (đủ cho mọi spacing)
-    close_iters = 5
-    tooth_mask = ndimage.binary_closing(
-        tooth_mask, structure=struct_close, iterations=close_iters
+    tooth_mask = (img_norm >= otsu_t).astype(np.uint8)
+
+    # --- Fill holes per-slice (lấp khoang tủy tối bên trong răng) ---
+    # Dùng fill_holes thay vì closing → không merge 2 răng sát nhau
+    tooth_mask_filled = ndimage.binary_fill_holes(tooth_mask).astype(np.uint8)
+
+    # --- Erosion nhẹ để đảm bảo tách răng dính nhau ---
+    struct_erode = ndimage.generate_binary_structure(3, 1)
+    erode_iters = max(1, min(3, int(min(image.shape) * 0.01)))
+    tooth_eroded = ndimage.binary_erosion(
+        tooth_mask_filled, structure=struct_erode, iterations=erode_iters
     ).astype(np.uint8)
 
-    # Connected component analysis
+    # --- CC trên mask đã erode để đếm số "seed" răng ---
     struct_cc = ndimage.generate_binary_structure(3, 1)
-    labeled_tmp, n_tmp = ndimage.label(tooth_mask, structure=struct_cc)
+    seeds, n_seeds = ndimage.label(tooth_eroded, structure=struct_cc)
 
-    if n_tmp == 0:
+    if n_seeds == 0:
+        # Fallback: CC trên mask gốc (không erode)
+        seeds, n_seeds = ndimage.label(tooth_mask_filled, structure=struct_cc)
+
+    if n_seeds == 0:
         return np.zeros_like(image, dtype=np.int32), 0
 
-    sizes = ndimage.sum(tooth_mask, labeled_tmp, range(1, n_tmp + 1))
+    print(f"    Seeds sau erosion ({erode_iters}x): {n_seeds} components")
 
-    # Xóa component quá lớn (>50% tổng foreground) — likely là bone/background
-    # chứ không phải răng riêng lẻ. Nhưng chỉ xóa nếu có ít nhất 2 component
-    # (tránh xóa nhầm khi chỉ có 1 răng)
-    total_fg = tooth_mask.sum()
-    if n_tmp > 1:
-        for i, sz in enumerate(sizes):
-            if sz > 0.5 * total_fg:
-                tooth_mask[labeled_tmp == (i + 1)] = 0
+    # --- Distance transform + Watershed để tách chính xác ---
+    # Distance transform trên filled mask
+    dist = ndimage.distance_transform_edt(tooth_mask_filled)
 
-    # CC lần 2 để phân tách các răng (sau khi bỏ bone/background lớn)
-    labeled, num_found = ndimage.label(tooth_mask, structure=struct_cc)
-    if num_found == 0:
-        return np.zeros_like(image, dtype=np.int32), 0
+    # Dùng seeds từ eroded mask làm markers cho watershed
+    # Watershed chạy trên -distance (tìm "valley" giữa 2 răng)
+    labeled = watershed(-dist, markers=seeds, mask=tooth_mask_filled)
 
-    component_sizes = ndimage.sum(tooth_mask, labeled, range(1, num_found + 1))
-    keep_mask = component_sizes >= min_voxels
+    # --- Filter bỏ component nhỏ ---
+    component_sizes = ndimage.sum(
+        tooth_mask_filled, labeled, range(1, labeled.max() + 1)
+    )
 
     new_labeled = np.zeros_like(labeled)
     new_idx = 1
-    for i, keep in enumerate(keep_mask):
-        if keep:
+    for i, sz in enumerate(component_sizes):
+        if sz >= min_voxels:
             new_labeled[labeled == (i + 1)] = new_idx
             new_idx += 1
 
-    return new_labeled, new_idx - 1
+    num_teeth = new_idx - 1
+    print(f"    Sau filter (min_voxels={min_voxels}): {num_teeth} răng")
+    return new_labeled, num_teeth
 
 
 def process_case_inference(
