@@ -314,7 +314,7 @@ def find_teeth_from_image(
     EXPECTED_MIN = max(2, num_expected - 3)
     EXPECTED_MAX = num_expected + 4
 
-    md_max = max(5, int(max_dist * 0.7))
+    md_max = max(5, int(max_dist * 0.9))
     md_min = max(2, int(max_dist * 0.08))
     scan_results = []
 
@@ -422,56 +422,82 @@ def find_teeth_from_image(
         for lbl in range(1, max_label + 1)
     ])
 
-    # Merge: nếu N > num_expected, merge region nhỏ nhất vào neighbor gần nhất
-    # cho đến khi N = num_expected hoặc không còn region nhỏ
-    current_labels = list(range(max_label))  # 0-indexed: region i+1
-    merge_map = {i: i for i in range(max_label)}  # track merges
+    # Merge strategy 2 bước:
+    #   Bước A: merge region NHỎ (< 30% median) vào neighbor gần nhất
+    #   Bước B: nếu vẫn N > num_expected → merge 2 regions có centroid
+    #           GẦN NHAU NHẤT (= 2 nửa cùng 1 răng bị watershed tách nhầm)
+    merge_map = {i: i for i in range(max_label)}
 
-    median_size = np.median(region_sizes[region_sizes >= min_voxels]) if np.any(region_sizes >= min_voxels) else np.median(region_sizes)
-    # Region "nhỏ" = < 30% median size — likely noise/fragment
+    def get_valid_idxs():
+        return [i for i in range(max_label)
+                if region_sizes[i] >= min_voxels and merge_map[i] == i]
+
+    def do_merge(src, dst, reason=""):
+        """Gộp region src vào dst."""
+        labeled[labeled == (src + 1)] = dst + 1
+        old_sz = region_sizes[src]
+        w1, w2 = region_sizes[dst], region_sizes[src]
+        region_centroids[dst] = (
+            region_centroids[dst] * w1 + region_centroids[src] * w2
+        ) / (w1 + w2 + 1e-8)
+        region_sizes[dst] += region_sizes[src]
+        region_sizes[src] = 0
+        merge_map[src] = dst
+        n_now = len(get_valid_idxs())
+        print(f"    [Merge-{reason}] region {src+1} ({old_sz:,}vx) "
+              f"→ region {dst+1}, remaining={n_now}")
+
+    # --- Bước A: merge regions nhỏ ---
+    median_size = (np.median(region_sizes[region_sizes >= min_voxels])
+                   if np.any(region_sizes >= min_voxels)
+                   else np.median(region_sizes))
     small_threshold = median_size * 0.30
 
-    n_valid = sum(1 for sz in region_sizes if sz >= min_voxels)
-    while n_valid > num_expected:
-        # Tìm region nhỏ nhất trong các valid regions
-        valid_idxs = [i for i in range(max_label)
-                      if region_sizes[i] >= min_voxels and merge_map[i] == i]
-        if len(valid_idxs) <= num_expected:
-            break
+    while len(get_valid_idxs()) > num_expected:
+        valid_idxs = get_valid_idxs()
         smallest_idx = min(valid_idxs, key=lambda i: region_sizes[i])
         if region_sizes[smallest_idx] > small_threshold:
-            break  # Tất cả regions đều đủ lớn, stop merge
+            break  # Không còn region nhỏ → chuyển sang bước B
 
-        # Tìm neighbor gần nhất (theo centroid distance)
-        min_dist_val = float("inf")
-        nearest_idx = -1
-        for j in valid_idxs:
-            if j == smallest_idx:
-                continue
-            d = np.linalg.norm(region_centroids[smallest_idx] - region_centroids[j])
-            if d < min_dist_val:
-                min_dist_val = d
-                nearest_idx = j
-
+        # Tìm neighbor gần nhất
+        nearest_idx = min(
+            (j for j in valid_idxs if j != smallest_idx),
+            key=lambda j: np.linalg.norm(
+                region_centroids[smallest_idx] - region_centroids[j]),
+            default=-1,
+        )
         if nearest_idx < 0:
             break
+        do_merge(smallest_idx, nearest_idx, reason="small")
 
-        # Merge: gộp smallest vào nearest
-        labeled[labeled == (smallest_idx + 1)] = nearest_idx + 1
-        region_sizes[nearest_idx] += region_sizes[smallest_idx]
-        # Update centroid (weighted average)
-        w1 = region_sizes[nearest_idx] - region_sizes[smallest_idx]
-        w2 = region_sizes[smallest_idx]
-        region_centroids[nearest_idx] = (
-            region_centroids[nearest_idx] * w1 + region_centroids[smallest_idx] * w2
-        ) / (w1 + w2 + 1e-8)
-        region_sizes[smallest_idx] = 0
-        merge_map[smallest_idx] = nearest_idx
+    # --- Bước B: force-merge 2 regions gần nhau nhất (proximity) ---
+    # Khi tất cả regions đều lớn nhưng N vẫn > expected,
+    # 2 regions gần nhất rất có thể là 1 răng bị tách đôi
+    while len(get_valid_idxs()) > num_expected:
+        valid_idxs = get_valid_idxs()
+        if len(valid_idxs) <= num_expected:
+            break
 
-        n_valid = sum(1 for i in range(max_label)
-                      if region_sizes[i] >= min_voxels and merge_map[i] == i)
-        print(f"    [Merge] region {smallest_idx+1} ({region_sizes[smallest_idx]:,}vx) "
-              f"→ region {nearest_idx+1}, remaining={n_valid}")
+        # Tìm cặp (i, j) có centroid distance nhỏ nhất
+        best_pair = None
+        best_dist_val = float("inf")
+        for ii, idx_a in enumerate(valid_idxs):
+            for idx_b in valid_idxs[ii + 1:]:
+                d = np.linalg.norm(
+                    region_centroids[idx_a] - region_centroids[idx_b])
+                if d < best_dist_val:
+                    best_dist_val = d
+                    best_pair = (idx_a, idx_b)
+
+        if best_pair is None:
+            break
+
+        # Merge region nhỏ hơn vào region lớn hơn
+        a, b = best_pair
+        if region_sizes[a] < region_sizes[b]:
+            do_merge(a, b, reason="proximity")
+        else:
+            do_merge(b, a, reason="proximity")
 
     # =================================================================
     # 6. Filter bỏ component nhỏ + relabel liên tục
