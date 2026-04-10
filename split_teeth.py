@@ -290,41 +290,105 @@ def find_teeth_from_image(
     dist = ndimage.distance_transform_edt(full_mask)
 
     # Smooth để tránh double-peak trên 1 răng (bề mặt gồ ghề)
-    dist_smooth = gaussian_filter(dist, sigma=2.0)
-    print(f"    Distance transform: max={dist.max():.1f} voxels")
+    # sigma tỉ lệ theo kích thước volume (lớn hơn → smooth mạnh hơn)
+    sigma = max(1.0, min(image.shape) / 80.0)
+    dist_smooth = gaussian_filter(dist, sigma=sigma)
+    max_dist = dist.max()
+    print(f"    Distance transform: max={max_dist:.1f} voxels, sigma={sigma:.1f}")
 
-    # --- Tính min_distance adaptive theo volume ---
-    # Ước lượng bán kính răng trung bình:
-    #   total_fg / N_expected_teeth ≈ thể tích 1 răng
-    #   bán kính ≈ (3V / 4π)^(1/3)
-    # Dùng N=6 làm ước lượng ban đầu (dental CBCT thường 4-8 răng)
-    n_expected = 6
-    vol_per_tooth = full_mask.sum() / n_expected
-    est_radius = (3 * vol_per_tooth / (4 * np.pi)) ** (1.0 / 3.0)
-    # min_distance = ~40% bán kính (đủ nhỏ để không miss răng sát nhau,
-    #                                đủ lớn để không double-count)
-    min_dist = max(3, int(est_radius * 0.4))
-    # threshold_abs: peak phải ≥ 20% max_distance (loại fragment mỏng)
-    thresh_abs = max(2.0, dist.max() * 0.15)
-    print(f"    Est. tooth radius: {est_radius:.1f} voxels → "
-          f"min_distance={min_dist}, threshold_abs={thresh_abs:.1f}")
+    # --- threshold_abs: chỉ giữ peak đủ sâu bên trong mask ---
+    # Peak phải cách biên ít nhất ~10% max_distance (loại fragment/noise)
+    thresh_abs = max(2.0, max_dist * 0.10)
 
-    # Tìm peaks = tâm mỗi răng
-    coords = peak_local_max(
-        dist_smooth,
-        min_distance=min_dist,
-        threshold_abs=thresh_abs,
-        exclude_border=False,
-    )
-    n_seeds = len(coords)
-    print(f"    peak_local_max → {n_seeds} peaks")
+    # =================================================================
+    # Scan min_distance: tìm giá trị cho N peaks trong khoảng hợp lý
+    # =================================================================
+    # Dental CBCT thường chứa 1-10 răng.
+    # Scan min_distance từ lớn → nhỏ.
+    # Khi N peaks nằm trong [expected_min, expected_max] VÀ ổn định
+    # (không thay đổi nhiều qua 2-3 bước) → đó là kết quả đúng.
+    #
+    # Tại sao scan từ lớn → nhỏ:
+    #   - min_distance lớn → ít peaks (under-segment)
+    #   - min_distance nhỏ → nhiều peaks (over-segment)
+    #   - Đi từ lớn → nhỏ: khi N nhảy lên plateau ổn định = đáp án
+    #
+    # Ví dụ: md=30 → 2 peaks, md=20 → 4, md=12 → 6, md=10 → 6,
+    #         md=8 → 6, md=5 → 12, md=3 → 30
+    #         → plateau tại N=6 (md=12→8) = đáp án đúng
+    # =================================================================
+    EXPECTED_MIN = 2    # ít nhất 2 răng
+    EXPECTED_MAX = 12   # nhiều nhất 12 răng (hiếm khi >10 trong 1 FOV)
 
-    # Tạo seed labels: mỗi peak = 1 marker point
+    # Dải scan: từ max_dist/2 xuống 2
+    md_max = max(5, int(max_dist * 0.5))
+    md_min = 2
+    scan_results = []
+
+    for md in range(md_max, md_min - 1, -1):
+        coords_tmp = peak_local_max(
+            dist_smooth,
+            min_distance=md,
+            threshold_abs=thresh_abs,
+            exclude_border=False,
+        )
+        n = len(coords_tmp)
+        scan_results.append((md, n, coords_tmp))
+
+    # Tìm plateau ổn định: N không đổi qua ≥3 giá trị md liên tiếp
+    best_md = None
+    best_n = 0
+    best_coords = None
+
+    for i in range(len(scan_results) - 2):
+        md_i, n_i, c_i = scan_results[i]
+        _, n_i1, _ = scan_results[i + 1]
+        _, n_i2, _ = scan_results[i + 2]
+
+        # N phải trong khoảng hợp lý VÀ ổn định 3 bước liên tiếp
+        if (EXPECTED_MIN <= n_i <= EXPECTED_MAX
+                and n_i == n_i1 == n_i2):
+            best_md = md_i
+            best_n = n_i
+            best_coords = c_i
+            break
+
+    # Fallback: nếu không tìm thấy plateau, chọn md cho N gần 6 nhất
+    if best_coords is None:
+        valid = [(md, n, c) for md, n, c in scan_results
+                 if EXPECTED_MIN <= n <= EXPECTED_MAX]
+        if valid:
+            # Chọn cái có N gần 6 nhất, ưu tiên md lớn hơn (ít over-segment)
+            valid.sort(key=lambda x: (abs(x[1] - 6), -x[0]))
+            best_md, best_n, best_coords = valid[0]
+        else:
+            # Không có kết quả trong range → chọn cái có N nhỏ nhất > 1
+            valid_any = [(md, n, c) for md, n, c in scan_results if n >= 2]
+            if valid_any:
+                valid_any.sort(key=lambda x: (x[1], -x[0]))
+                best_md, best_n, best_coords = valid_any[0]
+
+    # Log scan summary
+    unique_ns = []
+    for md, n, _ in scan_results:
+        if not unique_ns or unique_ns[-1][1] != n:
+            unique_ns.append((md, n))
+    scan_summary = ", ".join(f"md={md}→{n}" for md, n in unique_ns[:10])
+    print(f"    Scan: {scan_summary}")
+    print(f"    → Best: min_distance={best_md}, peaks={best_n}")
+
+    if best_coords is None or best_n == 0:
+        return np.zeros_like(image, dtype=np.int32), 0
+
+    coords = best_coords
+    n_seeds = best_n
+
+    # Tạo seed labels
     seed_labels = np.zeros(full_mask.shape, dtype=np.int32)
     for i, (z, y, x) in enumerate(coords, 1):
         seed_labels[z, y, x] = i
 
-    # Dilate seeds 1 voxel để watershed robust hơn (marker = small sphere)
+    # Dilate seeds 1 voxel để watershed robust hơn
     if n_seeds > 0:
         seed_labels = ndimage.maximum_filter(seed_labels, size=3)
 
