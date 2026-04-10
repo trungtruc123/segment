@@ -313,6 +313,31 @@ def run(args):
     pred_nii.header.set_data_dtype(np.uint8)
     nib.save(pred_nii, str(pred_out))
 
+    # tooth_detection_map.nii.gz = component map (mỗi răng 1 màu riêng)
+    det_out = out_dir / "tooth_detection_map.nii.gz"
+    det_nii = nib.Nifti1Image(components.astype(np.uint8), affine)
+    det_nii.header.set_data_dtype(np.uint8)
+    nib.save(det_nii, str(det_out))
+
+    # Debug: save từng crop + prediction riêng lẻ
+    crops_dir = out_dir / "crops"
+    crops_dir.mkdir(exist_ok=True)
+    for tooth_idx in range(1, num_teeth + 1):
+        this_mask = components == tooth_idx
+        bbox = get_bounding_box(this_mask, margin=margin_voxels)
+        if bbox is None:
+            continue
+        crop_img = image[bbox]
+        crop_pred = full_label[bbox]
+        nib.save(
+            nib.Nifti1Image(crop_img.astype(np.float32), np.eye(4)),
+            str(crops_dir / f"tooth{tooth_idx:02d}_image.nii.gz"),
+        )
+        nib.save(
+            nib.Nifti1Image(crop_pred.astype(np.uint8), np.eye(4)),
+            str(crops_dir / f"tooth{tooth_idx:02d}_pred.nii.gz"),
+        )
+
     total_tooth = int((full_label == 1).sum())
     total_canal = int((full_label == 2).sum())
     total_time = sum(timings) + t_detect
@@ -326,6 +351,8 @@ def run(args):
     print(f"  Full-CBCT voxels:    tooth={total_tooth:,}  canal={total_canal:,}")
     print(f"\n  📄 {input_out}")
     print(f"  📄 {pred_out}")
+    print(f"  📄 {det_out}  (detection map — mỗi răng 1 giá trị)")
+    print(f"  📁 {crops_dir}/  ({num_teeth} crops riêng lẻ)")
     print(f"\nMở 3D Slicer:")
     print(f"  File → Add Data → chọn cả 2 file trên")
     print(f"  File label nhớ tick cột Description = 'Segmentation'")
