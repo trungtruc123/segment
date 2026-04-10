@@ -242,87 +242,77 @@ def find_teeth_from_image(
     img_norm = (img_norm - p_low) / (p_high - p_low + 1e-8)
 
     # =================================================================
-    # 2. Threshold THẤP (Otsu) → full tooth mask (bao gồm dentin dính)
+    # 2. Tạo 2 masks: TOOTH mask (cao) cho seeds, FULL mask cho watershed
     # =================================================================
-    try:
-        from skimage.filters import threshold_otsu
-        fg_vals = img_norm[img_norm > 0.01]
-        if len(fg_vals) > 1000:
-            otsu_t = threshold_otsu(fg_vals)
-        else:
-            otsu_t = np.percentile(img_norm, percentile_low)
-    except ImportError:
-        otsu_t = np.percentile(img_norm, percentile_low)
-
-    full_mask = (img_norm >= otsu_t).astype(np.uint8)
-    # Fill holes để lấp khoang tủy tối bên trong răng
-    full_mask = ndimage.binary_fill_holes(full_mask).astype(np.uint8)
-    print(f"    Otsu threshold: {otsu_t:.3f} → "
-          f"full_mask: {full_mask.sum():,} voxels")
-
-    # =================================================================
-    # 3. Tạo seeds bằng Distance Transform + peak_local_max
-    # =================================================================
-    # Chiến lược:
-    #   - Distance transform: mỗi voxel = khoảng cách tới biên gần nhất
-    #   - TÂM mỗi răng có distance CAO (xa biên nhất, ~bán kính răng)
-    #   - CẦU NỐI dentin giữa 2 răng luôn có distance THẤP (mỏng →
-    #     gần biên cả 2 phía) → KHÔNG BAO GIỜ là peak
-    #   - peak_local_max(min_distance=X) tìm đúng 1 đỉnh / răng
-    #     nếu X ≈ nửa bán kính răng nhỏ nhất
+    # Vấn đề Otsu: bắt cả xương ổ răng (alveolar bone) cùng intensity
+    # với dentin → distance transform có peaks ở xương → nhiễu.
     #
-    # Tại sao tốt hơn erosion:
-    #   - Erosion co ĐỀU mọi thứ → răng nhỏ biến mất trước khi bridge đứt
-    #   - Distance transform: bridge mỏng 1mm luôn có dist ~0.5mm,
-    #     trong khi tâm răng nhỏ nhất vẫn có dist ~2-3mm → luôn tách được
-    #
-    # Parameters:
-    #   min_distance: nửa bán kính răng nhỏ nhất (premolar ~3mm →
-    #                 ở 0.25mm spacing = 12 voxels)
-    #   threshold_abs: loại noise fragment (peak phải >= X voxels từ biên)
+    # Giải pháp: dùng 2 mức threshold:
+    #   - TOOTH mask (percentile 75): chỉ phần sáng nhất = enamel + dentin
+    #     → loại xương ổ (hơi tối hơn) → distance transform sạch
+    #   - FULL mask (Otsu, thấp hơn): bao gồm cả chân răng + dentin
+    #     → dùng cho watershed mở rộng seeds ra toàn bộ thể tích răng
     # =================================================================
     from skimage.feature import peak_local_max
     from scipy.ndimage import gaussian_filter
 
+    try:
+        from skimage.filters import threshold_otsu
+        fg_vals = img_norm[img_norm > 0.01]
+        otsu_t = threshold_otsu(fg_vals) if len(fg_vals) > 1000 else 0.3
+    except ImportError:
+        otsu_t = np.percentile(img_norm, percentile_low)
+
+    # FULL mask: Otsu → cho watershed (bao gồm toàn bộ cấu trúc răng)
+    full_mask = (img_norm >= otsu_t).astype(np.uint8)
+    full_mask = ndimage.binary_fill_holes(full_mask).astype(np.uint8)
+
+    # TOOTH mask: percentile 75 → chỉ phần cứng nhất (enamel+dentin core)
+    # Loại xương ổ, mô mềm → distance transform chỉ có peaks ở lõi răng
+    tooth_t = np.percentile(img_norm[full_mask > 0], 50)  # median CỦA foreground
+    tooth_mask = (img_norm >= tooth_t).astype(np.uint8)
+    tooth_mask = ndimage.binary_fill_holes(tooth_mask).astype(np.uint8)
+
+    # Opening nhẹ trên tooth_mask để cắt cầu nối mỏng giữa răng
+    struct_open = ndimage.generate_binary_structure(3, 1)
+    tooth_mask = ndimage.binary_opening(
+        tooth_mask, structure=struct_open, iterations=2
+    ).astype(np.uint8)
+
+    print(f"    Otsu: {otsu_t:.3f} → full_mask: {full_mask.sum():,} vx")
+    print(f"    Tooth: {tooth_t:.3f} → tooth_mask: {tooth_mask.sum():,} vx")
+
+    # =================================================================
+    # 3. Distance Transform trên TOOTH mask + peak_local_max
+    # =================================================================
     struct_cc = ndimage.generate_binary_structure(3, 1)
 
-    # Distance transform
-    dist = ndimage.distance_transform_edt(full_mask)
+    # Distance transform trên tooth_mask (không phải full_mask!)
+    # → peaks chỉ ở lõi răng, không ở xương
+    dist = ndimage.distance_transform_edt(tooth_mask)
 
-    # Smooth để tránh double-peak trên 1 răng (bề mặt gồ ghề)
-    # sigma tỉ lệ theo kích thước volume (lớn hơn → smooth mạnh hơn)
-    sigma = max(1.0, min(image.shape) / 80.0)
+    # Smooth mạnh: sigma = 3 voxels (tương đương ~0.75mm ở 0.25mm spacing)
+    # Đủ lớn để merge double-peaks trên 1 răng, đủ nhỏ để giữ 2 peaks 2 răng sát
+    sigma = 3.0
     dist_smooth = gaussian_filter(dist, sigma=sigma)
     max_dist = dist.max()
-    print(f"    Distance transform: max={max_dist:.1f} voxels, sigma={sigma:.1f}")
+    print(f"    Distance transform: max={max_dist:.1f} vx, sigma={sigma:.1f}")
 
-    # --- threshold_abs: chỉ giữ peak đủ sâu bên trong mask ---
-    # Peak phải cách biên ít nhất ~10% max_distance (loại fragment/noise)
-    thresh_abs = max(2.0, max_dist * 0.10)
+    # threshold_abs CAO: peak phải cách biên ≥ 25% max_distance
+    # → loại sạch fragment nhỏ, xương mỏng, noise
+    # Ở downsample (161³): max_dist ~15-20 → thresh ~4-5 vx
+    # = chỉ giữ peaks sâu ít nhất 1mm bên trong cấu trúc
+    thresh_abs = max(3.0, max_dist * 0.25)
 
     # =================================================================
-    # Scan min_distance: tìm giá trị cho N peaks trong khoảng hợp lý
+    # Scan min_distance: tìm PLATEAU cho N peaks ổn định
     # =================================================================
-    # Dental CBCT thường chứa 1-10 răng.
-    # Scan min_distance từ lớn → nhỏ.
-    # Khi N peaks nằm trong [expected_min, expected_max] VÀ ổn định
-    # (không thay đổi nhiều qua 2-3 bước) → đó là kết quả đúng.
-    #
-    # Tại sao scan từ lớn → nhỏ:
-    #   - min_distance lớn → ít peaks (under-segment)
-    #   - min_distance nhỏ → nhiều peaks (over-segment)
-    #   - Đi từ lớn → nhỏ: khi N nhảy lên plateau ổn định = đáp án
-    #
-    # Ví dụ: md=30 → 2 peaks, md=20 → 4, md=12 → 6, md=10 → 6,
-    #         md=8 → 6, md=5 → 12, md=3 → 30
-    #         → plateau tại N=6 (md=12→8) = đáp án đúng
-    # =================================================================
-    EXPECTED_MIN = 2    # ít nhất 2 răng
-    EXPECTED_MAX = 12   # nhiều nhất 12 răng (hiếm khi >10 trong 1 FOV)
+    # Dental CBCT FOV nhỏ: thường 3-8 răng.
+    EXPECTED_MIN = 2
+    EXPECTED_MAX = 10
 
-    # Dải scan: từ max_dist/2 xuống 2
-    md_max = max(5, int(max_dist * 0.5))
-    md_min = 2
+    md_max = max(5, int(max_dist * 0.6))
+    md_min = max(2, int(max_dist * 0.1))
     scan_results = []
 
     for md in range(md_max, md_min - 1, -1):
@@ -335,7 +325,7 @@ def find_teeth_from_image(
         n = len(coords_tmp)
         scan_results.append((md, n, coords_tmp))
 
-    # Tìm plateau ổn định: N không đổi qua ≥3 giá trị md liên tiếp
+    # Tìm plateau: N giữ nguyên qua ≥3 bước liên tiếp
     best_md = None
     best_n = 0
     best_coords = None
@@ -344,8 +334,6 @@ def find_teeth_from_image(
         md_i, n_i, c_i = scan_results[i]
         _, n_i1, _ = scan_results[i + 1]
         _, n_i2, _ = scan_results[i + 2]
-
-        # N phải trong khoảng hợp lý VÀ ổn định 3 bước liên tiếp
         if (EXPECTED_MIN <= n_i <= EXPECTED_MAX
                 and n_i == n_i1 == n_i2):
             best_md = md_i
@@ -353,29 +341,27 @@ def find_teeth_from_image(
             best_coords = c_i
             break
 
-    # Fallback: nếu không tìm thấy plateau, chọn md cho N gần 6 nhất
+    # Fallback: chọn N gần expected nhất (ưu tiên 6)
     if best_coords is None:
         valid = [(md, n, c) for md, n, c in scan_results
                  if EXPECTED_MIN <= n <= EXPECTED_MAX]
         if valid:
-            # Chọn cái có N gần 6 nhất, ưu tiên md lớn hơn (ít over-segment)
             valid.sort(key=lambda x: (abs(x[1] - 6), -x[0]))
             best_md, best_n, best_coords = valid[0]
         else:
-            # Không có kết quả trong range → chọn cái có N nhỏ nhất > 1
             valid_any = [(md, n, c) for md, n, c in scan_results if n >= 2]
             if valid_any:
                 valid_any.sort(key=lambda x: (x[1], -x[0]))
                 best_md, best_n, best_coords = valid_any[0]
 
-    # Log scan summary
+    # Log
     unique_ns = []
     for md, n, _ in scan_results:
         if not unique_ns or unique_ns[-1][1] != n:
             unique_ns.append((md, n))
-    scan_summary = ", ".join(f"md={md}→{n}" for md, n in unique_ns[:10])
-    print(f"    Scan: {scan_summary}")
-    print(f"    → Best: min_distance={best_md}, peaks={best_n}")
+    print(f"    Scan: {', '.join(f'md={md}→{n}' for md, n in unique_ns[:12])}")
+    print(f"    → Best: min_distance={best_md}, peaks={best_n}, "
+          f"thresh_abs={thresh_abs:.1f}")
 
     if best_coords is None or best_n == 0:
         return np.zeros_like(image, dtype=np.int32), 0
@@ -383,14 +369,12 @@ def find_teeth_from_image(
     coords = best_coords
     n_seeds = best_n
 
-    # Tạo seed labels
+    # Tạo seed labels (dùng cho watershed trên FULL mask)
     seed_labels = np.zeros(full_mask.shape, dtype=np.int32)
     for i, (z, y, x) in enumerate(coords, 1):
         seed_labels[z, y, x] = i
-
-    # Dilate seeds 1 voxel để watershed robust hơn
-    if n_seeds > 0:
-        seed_labels = ndimage.maximum_filter(seed_labels, size=3)
+    # Dilate seeds nhẹ để watershed stable
+    seed_labels = ndimage.maximum_filter(seed_labels, size=3)
 
     if n_seeds == 0:
         return np.zeros_like(image, dtype=np.int32), 0
