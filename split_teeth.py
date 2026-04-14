@@ -514,7 +514,45 @@ def find_teeth_from_image(
     num_teeth = new_idx - 1
     print(f"    Watershed → {max_label} regions → merge → "
           f"filter (min={min_voxels}): {num_teeth} răng")
-    return new_labeled, num_teeth
+
+    # =================================================================
+    # 7. TIGHTEN: loại bỏ bone/tissue KHÔNG thuộc răng khỏi mỗi region
+    # =================================================================
+    # Vấn đề: watershed trên full_mask gán cả xương ổ răng vào regions
+    # → bbox quá lớn, crop chứa nhiều răng lân cận.
+    #
+    # Giải pháp: chỉ giữ voxels gần tooth_mask (dilate nhẹ để bao chân răng)
+    # + giữ largest connected component mỗi region (loại fragment lẻ)
+    struct_dilate = ndimage.generate_binary_structure(3, 1)
+    tight_mask = ndimage.binary_dilation(
+        tooth_mask, structure=struct_dilate, iterations=5
+    ).astype(np.uint8)
+    # Intersection: chỉ giữ phần vừa thuộc watershed region VÀ gần tooth
+    tight_mask = tight_mask & full_mask
+
+    new_labeled[~tight_mask.astype(bool)] = 0
+
+    # Mỗi region: chỉ giữ largest connected component (loại fragments lẻ xa)
+    struct_cc = ndimage.generate_binary_structure(3, 1)
+    final_labeled = np.zeros_like(new_labeled)
+    final_idx = 1
+    for lbl in range(1, num_teeth + 1):
+        region = (new_labeled == lbl)
+        if region.sum() == 0:
+            continue
+        cc_labeled, n_cc = ndimage.label(region, structure=struct_cc)
+        if n_cc <= 1:
+            final_labeled[region] = final_idx
+        else:
+            # Giữ CC lớn nhất
+            cc_sizes = ndimage.sum(region, cc_labeled, range(1, n_cc + 1))
+            largest_cc = int(np.argmax(cc_sizes)) + 1
+            final_labeled[cc_labeled == largest_cc] = final_idx
+        final_idx += 1
+
+    num_teeth = final_idx - 1
+    print(f"    Tighten → {num_teeth} răng (loại bone, giữ largest CC)")
+    return final_labeled, num_teeth
 
 
 def process_case_inference(

@@ -386,8 +386,9 @@ def parse_args():
     # Tooth detection
     parser.add_argument("--margin", type=int, default=15,
                         help="(deprecated, dùng --margin_mm) Margin voxel quanh bbox")
-    parser.add_argument("--margin_mm", type=float, default=5.0,
-                        help="Margin (mm) quanh bbox răng — tự convert sang voxels")
+    parser.add_argument("--margin_mm", type=float, default=1.2,
+                        help="Margin (mm) quanh bbox răng — tự convert sang voxels. "
+                             "Default=1.2mm ≈ 15 voxels ở 0.08mm (giống training data)")
     parser.add_argument("--min_voxels", type=int, default=5000,
                         help="Min voxels để coi là 1 răng")
     parser.add_argument("--percentile_threshold", type=float, default=60.0,
