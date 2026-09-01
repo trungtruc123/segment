@@ -32,10 +32,26 @@ import numpy as np
 from scipy import ndimage
 
 
-def load_nifti(path: str) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
-    """Load NIfTI file, trả về (data, affine, header)."""
+def load_nifti(
+    path: str,
+    dtype=np.float32,
+) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
+    """
+    Load NIfTI file, trả về (data, affine, header).
+
+    QUAN TRỌNG (RAM): `img.get_fdata()` LUÔN trả về float64.
+      - data_v1: 503³  = 127M voxel → 1.0 GB/volume  (chịu được)
+      - data_v2: 714³  = 364M voxel → 2.9 GB/volume  (ảnh gốc đã là float64!)
+    Với data_v2, image + label + components dưới float64/int64 sẽ ăn
+    >12 GB → OOM trên Colab standard. Ở đây đọc qua `dataobj` rồi ép dtype:
+        image -> float32 (đủ chính xác cho CBCT, giảm 2x RAM)
+        label -> uint8   (chỉ có giá trị 0/1/2, giảm 8x RAM)
+    """
     img = nib.load(path)
-    return img.get_fdata(), img.affine, img.header
+    data = np.asanyarray(img.dataobj)
+    if data.dtype != np.dtype(dtype):
+        data = data.astype(dtype, copy=False)
+    return data, img.affine, img.header
 
 
 def save_nifti(
@@ -102,15 +118,22 @@ def find_individual_teeth(
 
     # Lọc bỏ các component quá nhỏ (nhiễu)
     component_sizes = ndimage.sum(full_tooth_mask, labeled, range(1, num_found + 1))
-    keep_mask = component_sizes >= min_voxels
+    keep_mask = np.asarray(component_sizes) >= min_voxels
+    del full_tooth_mask
 
-    # Relabel: chỉ giữ components lớn
-    new_labeled = np.zeros_like(labeled)
+    # Relabel bằng lookup-table thay vì vòng lặp `labeled == (i+1)`.
+    # Cách cũ tạo 1 boolean mask cỡ full-volume cho MỖI component
+    # (data_v2 có ~50 components × 364 MB → rất chậm + tốn RAM).
+    # LUT chỉ index 1 lần, output int16 (giảm 2x so với int32 của ndimage).
+    lut = np.zeros(num_found + 1, dtype=np.int16)
     new_idx = 1
     for i, keep in enumerate(keep_mask):
         if keep:
-            new_labeled[labeled == (i + 1)] = new_idx
+            lut[i + 1] = new_idx
             new_idx += 1
+
+    new_labeled = lut[labeled]
+    del labeled
 
     num_teeth = new_idx - 1
     return new_labeled, num_teeth
@@ -618,15 +641,17 @@ def process_case(
         Số lượng răng đã được lưu
     """
     print(f"\n[{case_id}] Loading {image_path}")
-    image, affine, header = load_nifti(image_path)
-    label, _, label_header = load_nifti(label_path)
+    # image -> float32, label -> uint8 để không nổ RAM với volume 714³ của data_v2
+    image, affine, header = load_nifti(image_path, dtype=np.float32)
+    label, _, label_header = load_nifti(label_path, dtype=np.uint8)
 
-    print(f"  Volume shape: {image.shape}")
-    print(f"  Label unique values: {np.unique(label.astype(int))}")
+    print(f"  Volume shape: {image.shape} (image dtype={image.dtype}, "
+          f"~{image.nbytes / 1e9:.2f} GB in RAM)")
+    print(f"  Label unique values: {np.unique(label)}")
 
     # Phân tách các răng riêng lẻ
     components, num_teeth = find_individual_teeth(
-        label.astype(int), tooth_label=1, min_voxels=min_voxels
+        label, tooth_label=1, min_voxels=min_voxels
     )
     print(f"  Tìm thấy {num_teeth} răng")
 

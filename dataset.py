@@ -5,7 +5,7 @@ Supports NIfTI (.nii.gz) and NRRD (.nrrd) volumes.
 import os
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import nibabel as nib
 import numpy as np
@@ -44,17 +44,28 @@ def extract_case_id(filename: str) -> str:
     return stem
 
 
-def prepare_data_list(data_dir: str) -> List[Dict[str, str]]:
+def prepare_data_list(
+    data_dir: str,
+    source: Optional[str] = None,
+) -> List[Dict[str, str]]:
     """
-    Build list of {"image": path, "label": path, "case_id": str} dicts.
-    case_id dùng để group các răng cùng 1 ca CBCT gốc
-    (tránh leakage khi split train/val/test).
+    Build list of {"image", "label", "case_id", "source"} dicts.
+
+    case_id dùng để group các răng cùng 1 ca CBCT gốc (tránh leakage khi split).
+    source  đánh dấu răng đến từ dataset nào ("v1" / "v2") — cần cho:
+        - fine-tune trên tập gộp v1+v2
+        - báo cáo dice riêng cho từng domain
+        - ghim toàn bộ v1 vào train (xem kfold_split_by_case)
     """
     img_dir = Path(data_dir) / "images"
     mask_dir = Path(data_dir) / "masks"
+    if source is None:
+        source = Path(data_dir).parent.name or Path(data_dir).name
 
     data_list = []
     for img_file in sorted(img_dir.iterdir()):
+        if img_file.name.startswith("."):
+            continue
         stem = img_file.name.split(".")[0]
         # Find matching mask
         mask_candidates = list(mask_dir.glob(f"{stem}*"))
@@ -63,8 +74,74 @@ def prepare_data_list(data_dir: str) -> List[Dict[str, str]]:
                 "image": str(img_file),
                 "label": str(mask_candidates[0]),
                 "case_id": extract_case_id(img_file.name),
+                "source": source,
             })
     return data_list
+
+
+def prepare_multi_data_list(
+    sources: Dict[str, str],
+) -> List[Dict[str, str]]:
+    """
+    Gộp nhiều thư mục teeth/ thành 1 data_list duy nhất.
+
+    Args:
+        sources: {"v1": "/path/to/data_v1/teeth", "v2": "/path/to/data_v2/teeth"}
+
+    Trả về list đã gộp, mỗi item có thêm khóa "source".
+    Nếu 2 dataset trùng case_id, case_id sẽ được prefix bằng source
+    ("v2::LT2_NT2") để K-fold không gộp nhầm 2 ca khác nhau.
+    """
+    per_source = {}
+    for name, d in sources.items():
+        items = prepare_data_list(d, source=name)
+        per_source[name] = items
+        print(f"  [{name}] {len(items)} răng "
+              f"từ {len(set(i['case_id'] for i in items))} ca  ({d})")
+
+    # Phát hiện trùng case_id giữa các dataset
+    seen = {}
+    clash = set()
+    for name, items in per_source.items():
+        for cid in set(i["case_id"] for i in items):
+            if cid in seen and seen[cid] != name:
+                clash.add(cid)
+            seen[cid] = name
+
+    merged = []
+    for name, items in per_source.items():
+        for it in items:
+            if it["case_id"] in clash:
+                it["case_id"] = f"{name}::{it['case_id']}"
+            merged.append(it)
+
+    if clash:
+        print(f"  [INFO] {len(clash)} case_id trùng giữa các dataset → đã prefix source.")
+    print(f"  → Tổng: {len(merged)} răng / "
+          f"{len(set(i['case_id'] for i in merged))} ca")
+    return merged
+
+
+def oversample_by_source(
+    data_list: List[Dict],
+    factors: Dict[str, int],
+) -> List[Dict]:
+    """
+    Nhân bản các item theo source để cân bằng khi gộp 2 dataset lệch nhau.
+
+    Ví dụ v1 có 25 răng, v2 có 18 răng nhưng v2 mới là domain đích:
+        oversample_by_source(train, {"v2": 2})  -> v2 xuất hiện 2 lần/epoch.
+
+    Chỉ dùng cho TRAIN list, KHÔNG dùng cho val (sẽ làm sai metric).
+    """
+    out = []
+    for item in data_list:
+        out.extend([item] * max(1, int(factors.get(item.get("source", ""), 1))))
+    if factors:
+        from collections import Counter
+        c = Counter(i.get("source") for i in out)
+        print(f"  [oversample] train theo source: {dict(c)}")
+    return out
 
 
 def split_dataset(
@@ -140,6 +217,8 @@ def kfold_split_by_case(
     data_list: List[Dict],
     n_folds: int = 4,
     seed: int = 42,
+    val_sources: Optional[Sequence[str]] = None,
+    always_train_sources: Sequence[str] = (),
 ) -> List[Tuple[List[Dict], List[Dict]]]:
     """
     K-fold cross-validation ở mức case_id.
@@ -150,47 +229,78 @@ def kfold_split_by_case(
     Mỗi ca được dùng làm validation đúng 1 lần -> tận dụng hết dữ liệu.
 
     Args:
-        data_list: list các item có khóa "case_id"
+        data_list: list các item có khóa "case_id" (và "source" nếu gộp dataset)
         n_folds: số fold (mặc định = số case để leave-one-out theo ca)
         seed: random seed để shuffle case
+        val_sources: chỉ những ca thuộc các source này mới được dùng làm val.
+            Ví dụ val_sources=("v2",) → chỉ validate trên data_v2.
+        always_train_sources: các source LUÔN nằm trong train ở mọi fold.
+            Ví dụ always_train_sources=("v1",) khi fine-tune từ checkpoint đã
+            train trên v1: nếu để ca v1 vào val thì dice sẽ bị "thổi phồng"
+            (model đã nhìn thấy ca đó trong lần train trước) → metric vô nghĩa.
 
     Returns:
         List[(train_data, val_data)] có độ dài n_folds
     """
-    case_ids = sorted(set(item["case_id"] for item in data_list))
-    n_cases = len(case_ids)
+    case_source = {}
+    for item in data_list:
+        case_source.setdefault(item["case_id"], item.get("source", "default"))
 
-    if n_cases < 2:
+    all_cases = sorted(case_source)
+    if len(all_cases) < 2:
         raise ValueError(
-            f"Cần ít nhất 2 case để làm K-fold, chỉ tìm thấy {n_cases}"
+            f"Cần ít nhất 2 case để làm K-fold, chỉ tìm thấy {len(all_cases)}"
         )
 
-    if n_folds > n_cases:
-        print(f"[WARN] n_folds ({n_folds}) > số case ({n_cases}), "
-              f"dùng {n_cases}-fold (leave-one-case-out).")
-        n_folds = n_cases
+    # Case bị GHIM vào train ở MỌI fold (không bao giờ vào val)
+    pinned = {c for c in all_cases if case_source[c] in set(always_train_sources)}
 
-    # Shuffle case_ids để tránh bias theo thứ tự file
+    # Case ứng viên cho validation
+    if val_sources is not None:
+        candidates = [c for c in all_cases
+                      if case_source[c] in set(val_sources) and c not in pinned]
+    else:
+        candidates = [c for c in all_cases if c not in pinned]
+
+    if not candidates:
+        raise ValueError(
+            "Không còn case nào để validate. Kiểm tra val_sources / "
+            f"always_train_sources (sources có trong data: "
+            f"{sorted(set(case_source.values()))})"
+        )
+
+    if n_folds > len(candidates):
+        print(f"[WARN] n_folds ({n_folds}) > số case validate được "
+              f"({len(candidates)}), dùng {len(candidates)}-fold "
+              f"(leave-one-case-out).")
+        n_folds = len(candidates)
+
+    # Shuffle để tránh bias theo thứ tự file
     rng = np.random.RandomState(seed)
-    shuffled = list(case_ids)
+    shuffled = list(candidates)
     rng.shuffle(shuffled)
 
-    # Chia case_ids thành n_folds nhóm xấp xỉ đều nhau
+    # Chia candidates thành n_folds nhóm xấp xỉ đều nhau
     fold_cases = [[] for _ in range(n_folds)]
     for i, cid in enumerate(shuffled):
         fold_cases[i % n_folds].append(cid)
 
-    # Tạo các split train/val
+    if pinned:
+        print(f"[K-fold] {len(pinned)} ca luôn nằm trong train "
+              f"(source={sorted(set(always_train_sources))}): {sorted(pinned)}")
+    print(f"[K-fold] {len(candidates)} ca dùng để validate "
+          f"→ {n_folds} fold")
+
     folds = []
     for fold_idx in range(n_folds):
         val_cases = set(fold_cases[fold_idx])
-        train_cases = set(shuffled) - val_cases
+        train_cases = (set(all_cases) - val_cases)
 
         train_data = [d for d in data_list if d["case_id"] in train_cases]
         val_data = [d for d in data_list if d["case_id"] in val_cases]
 
         print(f"[Fold {fold_idx+1}/{n_folds}] "
-              f"train={len(train_data)} răng ({sorted(train_cases)}), "
+              f"train={len(train_data)} răng ({len(train_cases)} ca), "
               f"val={len(val_data)} răng ({sorted(val_cases)})")
 
         folds.append((train_data, val_data))
