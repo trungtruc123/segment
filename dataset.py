@@ -317,8 +317,20 @@ def get_fold_dataloaders(
     num_workers: int = 4,
     oversample_canal: bool = True,
     canal_oversample_ratio: float = 3.0,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Tạo train/val dataloaders cho 1 fold cụ thể."""
+    """
+    Tạo train/val dataloaders cho 1 fold cụ thể.
+
+    LƯU Ý về batch thực tế: `RandCropByPosNegLabeld(num_samples=2)` trả về 2 patch
+    cho mỗi item, và `list_data_collate` của MONAI làm phẳng chúng → số patch
+    mỗi step GPU = batch_size × 2. Đặt batch_size=8 nghĩa là 16 patch 96³/step.
+
+    persistent_workers: giữ worker sống qua các epoch. Dataset ở đây rất nhỏ
+    (~43 răng) nên mỗi epoch chỉ vài chục step — chi phí fork lại worker mỗi
+    epoch chiếm tỉ lệ đáng kể, nhất là khi GPU nhanh (A100).
+    """
     train_ds = CacheDataset(data=train_data, transform=train_transforms, cache_rate=1.0)
     val_ds = CacheDataset(data=val_data, transform=val_transforms, cache_rate=1.0)
 
@@ -330,13 +342,18 @@ def get_fold_dataloaders(
         )
         shuffle = False
 
+    extra = {}
+    if num_workers > 0:
+        extra = {"persistent_workers": persistent_workers,
+                 "prefetch_factor": prefetch_factor}
+
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=shuffle, sampler=sampler,
-        num_workers=num_workers, pin_memory=True,
+        num_workers=num_workers, pin_memory=True, **extra,
     )
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
+        num_workers=num_workers, pin_memory=True, **extra,
     )
     return train_loader, val_loader
 

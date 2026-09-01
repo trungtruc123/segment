@@ -122,7 +122,9 @@ là kết quả tốt hơn về mặt thực dụng. Đừng so trực tiếp ha
 | `split_teeth.py` | `load_nifti(path, dtype)` đọc qua `dataobj` thay cho `get_fdata()` (tránh float64); `process_case` load image→float32, label→uint8; `find_individual_teeth` relabel bằng lookup-table + `del` mảng trung gian. |
 | `dataset.py` | `prepare_data_list(dir, source=...)` gắn thêm khoá `"source"`; thêm `prepare_multi_data_list()` gộp nhiều thư mục teeth (tự prefix khi trùng case_id); thêm `oversample_by_source()`; `kfold_split_by_case()` thêm `val_sources=` và `always_train_sources=`. |
 | `finetune.py` | **Mới.** `FineTuneTrainer` + K-fold có auto-resume, nạp pretrained weights, freeze/unfreeze encoder, báo cáo dice tách riêng theo domain. |
-| `training.ipynb` | Cấu hình lại đường dẫn cho v1/v2, split cả hai tập, thay phần training bằng lời gọi `finetune.run_finetune()`; bỏ đoạn vá `losses.py` (repo đã dùng `register_buffer` từ lâu). |
+| `training.ipynb` | Cấu hình lại đường dẫn cho v1/v2, split cả hai tập, thay phần training bằng lời gọi `finetune.run_finetune()`; bỏ đoạn vá `losses.py` (repo đã dùng `register_buffer` từ lâu); cell 6a tự chọn preset theo GPU. |
+| `train.py` | `autocast` nhận `dtype` từ `self.amp_dtype` → hỗ trợ bf16 trên Ampere. |
+| `dataset.py` (dataloader) | `get_fold_dataloaders` thêm `persistent_workers` + `prefetch_factor` — dataset nhỏ nên chi phí fork worker mỗi epoch đáng kể khi GPU nhanh. |
 
 ---
 
@@ -160,6 +162,58 @@ python finetune.py ... --dry_run
 | `--v2_repeat` | `1` | Nhân bản mỗi răng v2 trong train N lần. Đặt `2` nếu v2 mới là domain đích thực sự (train sẽ thành 30 răng v1 + 36 lượt v2). |
 | `--epochs` | `100` | Fine-tune hội tụ nhanh hơn train from scratch (gốc 200). |
 | `--only_fold` | – | Chạy lại đúng một fold. |
+| `--batch_size` | `4` | **Số ITEM, không phải số patch.** `RandCropByPosNegLabeld(num_samples=2)` cho 2 patch mỗi item → patch/step = `batch_size × 2`. |
+| `--amp_dtype` | `fp16` | `bf16` chỉ chạy từ Ampere (A100/L4/H100). Nếu GPU không hỗ trợ, `run_finetune` tự hạ về fp16. |
+| `--sw_batch_size` | `4` | Số patch mỗi lượt sliding-window khi validate. |
+
+---
+
+## 4b. Chạy trên GPU mạnh (A100)
+
+`finetune.setup_gpu()` được gọi tự động ở đầu `run_finetune()` và bật:
+
+- **TF32** (`torch.backends.cuda.matmul.allow_tf32`, `cudnn.allow_tf32`) — Ampere
+  chạy conv/matmul fp32 trên tensor core, nhanh hơn đáng kể, không đổi chất lượng
+  segmentation. Không có tác dụng trên T4 (Turing).
+- **`cudnn.benchmark = True`** — cuDNN tự chọn thuật toán conv nhanh nhất. Chỉ có
+  lợi khi shape input cố định, đúng với pipeline này (patch 96³ khi train, roi 96³
+  khi sliding-window val).
+
+### Preset theo GPU
+
+| GPU | `--batch_size` | patch/step | `--num_workers` | `--amp_dtype` | `--sw_batch_size` | `--lr` |
+|---|---|---|---|---|---|---|
+| T4 16GB | 4 | 8 | 2 | `fp16` | 4 | 1e-4 |
+| L4 / A10 24GB | 6 | 12 | 4 | `bf16` | 6 | 1.2e-4 |
+| **A100 40GB** | **8** | **16** | **6** | **`bf16`** | **8** | **1.4e-4** |
+
+Notebook (cell 6a) tự chọn preset theo VRAM đọc được, nên không phải sửa tay.
+
+### Vì sao bf16 thay vì fp16 trên A100
+
+bf16 có dynamic range bằng fp32 nên **không cần `GradScaler`** và không bao giờ
+overflow thành `inf`. Điều này quan trọng với pipeline hiện tại vì deep supervision
+cộng 3 loss ở 3 scale, mỗi loss lại là Dice + Focal có `class_weights=[1,1,5]` —
+fp16 dễ underflow gradient của class canal (class nhỏ nhất). `FineTuneTrainer` tự
+tắt `GradScaler` khi dùng bf16.
+
+### Vì sao scale LR khi tăng batch
+
+Batch tăng gấp đôi (8 → 16 patch/step) làm gradient noise giảm, nên LR nên tăng
+theo. Ở đây dùng quy tắc **căn bậc hai** (`1e-4 × √2 ≈ 1.4e-4`) chứ không phải
+linear scaling, vì đây là fine-tune — mục tiêu là đi chậm để không phá weights đã
+học, không phải hội tụ nhanh nhất.
+
+### Điều A100 KHÔNG giải quyết
+
+- **Bước split** (`split_teeth.py`) chạy hoàn toàn trên CPU + RAM, không dùng GPU.
+  Đây vẫn là bước nặng nhất về bộ nhớ với data_v2 (714³).
+- **Dataset quá nhỏ** (~43 răng) nên mỗi epoch chỉ vài chục step. GPU nhanh sẽ dễ
+  bị *starve* vì dataloader — đó là lý do bật `persistent_workers=True` và
+  `prefetch_factor=4` trong `get_fold_dataloaders`. Nếu vẫn thấy GPU util thấp,
+  tăng `--num_workers` trước khi tăng `--batch_size`.
+- **Không nên tăng `--epochs`** chỉ vì train nhanh hơn. Với 43 mẫu, `early_stopping_patience=25`
+  thường dừng trước 100 epoch; train lâu hơn chỉ overfit.
 
 ### Chia fold thực tế (n_folds=5, seed=42)
 
