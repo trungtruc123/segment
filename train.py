@@ -152,7 +152,11 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
-            with autocast("cuda", enabled=self.use_amp):
+            # dtype của autocast: fp16 (mặc định, mọi GPU) hoặc bf16 (Ampere+).
+            # bf16 có dynamic range bằng fp32 → không cần GradScaler, không bị
+            # overflow/inf, ổn định hơn hẳn fp16 với deep supervision + focal loss.
+            with autocast("cuda", enabled=self.use_amp,
+                          dtype=getattr(self, "amp_dtype", torch.float16)):
                 output = self.model(images)
 
                 # Chuẩn hóa output của các kiến trúc khác nhau:

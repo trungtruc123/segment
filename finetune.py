@@ -31,6 +31,10 @@ Cách dùng:
     # Freeze encoder 20 epoch đầu rồi mở toàn bộ
     python finetune.py ... --freeze_encoder_epochs 20 --head_lr 3e-4 --lr 5e-5
 
+    # Preset A100 40GB
+    python finetune.py ... --batch_size 8 --num_workers 6 --amp_dtype bf16 \
+        --sw_batch_size 8 --lr 1.4e-4
+
     # Chỉ in ra cách chia fold, không train (kiểm tra nhanh, không cần GPU)
     python finetune.py ... --dry_run
 """
@@ -57,6 +61,56 @@ from transforms import get_train_transforms, get_val_transforms
 # Tên các submodule của DynUNet (MONAI) thuộc phần encoder.
 # Decoder = upsamples + output_block + deep_supervision_heads.
 ENCODER_PREFIXES = ("input_block", "downsamples", "bottleneck")
+
+
+def setup_gpu(verbose: bool = True) -> dict:
+    """
+    Bật các tối ưu phụ thuộc GPU và trả về thông tin để gợi ý siêu tham số.
+
+    - TF32: Ampere (A100/L4/RTX30+) chạy matmul/conv fp32 trên tensor core với
+      độ chính xác TF32 -> nhanh hơn nhiều, chất lượng segmentation không đổi.
+      KHÔNG có tác dụng trên T4 (Turing).
+    - cudnn.benchmark: cho cuDNN tự benchmark thuật toán conv tốt nhất ở lần
+      chạy đầu. Chỉ có lợi khi shape input CỐ ĐỊNH — đúng với pipeline này
+      (patch 96³ khi train, roi 96³ khi sliding-window val).
+    - bf16: Ampere trở lên hỗ trợ bfloat16 — dynamic range bằng fp32 nên không
+      cần GradScaler và không bị inf/overflow như fp16.
+    """
+    info = {"name": "cpu", "vram_gb": 0.0, "bf16": False, "tf32": False}
+    if not torch.cuda.is_available():
+        if verbose:
+            print("[GPU] Không thấy CUDA — sẽ chạy trên CPU (rất chậm).")
+        return info
+
+    props = torch.cuda.get_device_properties(0)
+    major = props.major
+    info.update(
+        name=props.name,
+        vram_gb=props.total_memory / 1024 ** 3,
+        bf16=major >= 8,          # Ampere trở lên
+        tf32=major >= 8,
+    )
+
+    torch.backends.cudnn.benchmark = True
+    if info["tf32"]:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    if verbose:
+        print(f"[GPU] {info['name']}  {info['vram_gb']:.1f} GB  "
+              f"(compute {major}.{props.minor})")
+        print(f"      cudnn.benchmark=True  TF32={info['tf32']}  "
+              f"bf16 khả dụng={info['bf16']}")
+        if info["vram_gb"] >= 35:
+            print("      → Gợi ý A100/H100: --batch_size 8 --num_workers 6 "
+                  "--amp_dtype bf16 --sw_batch_size 8")
+        elif info["vram_gb"] >= 20:
+            print("      → Gợi ý L4/A10 (24GB): --batch_size 6 --num_workers 4 "
+                  "--amp_dtype bf16")
+        else:
+            print("      → Gợi ý T4 (16GB): --batch_size 4 --num_workers 2 "
+                  "--amp_dtype fp16")
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +180,8 @@ class FineTuneTrainer(Trainer):
         pretrained: Optional[str] = None,
         freeze_encoder_epochs: int = 0,
         head_lr: Optional[float] = None,
+        amp_dtype: str = "fp16",
+        sw_batch_size: int = 4,
     ):
         from losses import CombinedLoss, DeepSupervisionLoss
         from model import build_model
@@ -178,8 +234,16 @@ class FineTuneTrainer(Trainer):
             total_epochs=train_config.epochs,
         )
 
-        self.scaler = GradScaler("cuda", enabled=train_config.use_amp)
+        # === Mixed precision ===
+        # bf16 không cần loss scaling (dynamic range = fp32) → tắt GradScaler.
+        # fp16 bắt buộc phải có scaler nếu không gradient nhỏ sẽ underflow về 0.
+        self.amp_dtype = torch.bfloat16 if amp_dtype == "bf16" else torch.float16
+        use_scaler = train_config.use_amp and self.amp_dtype is torch.float16
+        self.scaler = GradScaler("cuda", enabled=use_scaler)
         self.use_amp = train_config.use_amp
+        self.sw_batch_size = sw_batch_size
+        print(f"  AMP: {amp_dtype}  (GradScaler={'on' if use_scaler else 'off'})  "
+              f"sw_batch_size={sw_batch_size}")
 
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -249,7 +313,7 @@ class FineTuneTrainer(Trainer):
             output = sliding_window_inference(
                 images,
                 roi_size=self.data_config.patch_size,
-                sw_batch_size=4,
+                sw_batch_size=self.sw_batch_size,
                 predictor=self.model,
                 overlap=0.5,
             )
@@ -362,6 +426,8 @@ def train_one_fold(
         pretrained=args.pretrained,
         freeze_encoder_epochs=args.freeze_encoder_epochs,
         head_lr=args.head_lr,
+        amp_dtype=args.amp_dtype,
+        sw_batch_size=args.sw_batch_size,
     )
 
     # === Auto-resume trong CHÍNH lần fine-tune này ===
@@ -508,6 +574,11 @@ def build_folds(args):
 
 
 def run_finetune(args):
+    gpu = setup_gpu()
+    if args.amp_dtype == "bf16" and not gpu["bf16"]:
+        print("[WARN] GPU không hỗ trợ bf16 → tự chuyển về fp16.")
+        args.amp_dtype = "fp16"
+
     data_config = DataConfig(
         data_dir=args.teeth_dir_v2 or args.teeth_dir_v1,
         patch_size=tuple(args.patch_size),
@@ -536,8 +607,11 @@ def run_finetune(args):
     print(f"  LR:             {args.lr}   (gốc: 3e-4)")
     print(f"  Freeze encoder: {args.freeze_encoder_epochs} epoch "
           f"(head_lr={args.head_lr})")
-    print(f"  Batch size:     {args.batch_size}")
+    print(f"  Batch size:     {args.batch_size} "
+          f"(= {args.batch_size * 2} patch/step, do num_samples=2)")
     print(f"  Patch size:     {tuple(args.patch_size)}")
+    print(f"  AMP dtype:      {args.amp_dtype}")
+    print(f"  num_workers:    {args.num_workers}")
     print(f"  Class weights:  {args.class_weights}")
     print(f"  v2_repeat:      {args.v2_repeat}")
     print(f"  Checkpoint dir: {kfold_root}")
@@ -635,8 +709,17 @@ def parse_args(argv=None):
                         ">0 = chỉ train decoder+head trong N epoch đầu.")
     p.add_argument("--weight_decay", type=float, default=3e-5)
     p.add_argument("--warmup_epochs", type=int, default=5)
-    p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--batch_size", type=int, default=4,
+                   help="Số ITEM mỗi step; mỗi item cho 2 patch (num_samples=2) "
+                        "→ patch/step = batch_size × 2. T4: 4 | L4: 6 | A100: 8")
+    p.add_argument("--num_workers", type=int, default=2,
+                   help="Colab T4 nên để 2 (shared memory nhỏ); A100 để 6")
+    p.add_argument("--amp_dtype", type=str, default="fp16",
+                   choices=["fp16", "bf16"],
+                   help="bf16 chỉ chạy trên Ampere+ (A100/L4/H100), ổn định hơn fp16")
+    p.add_argument("--sw_batch_size", type=int, default=4,
+                   help="Số patch mỗi lượt sliding-window khi validate. "
+                        "A100 để 8 → validate nhanh gần gấp đôi")
     p.add_argument("--patience", type=int, default=25)
     p.add_argument("--class_weights", type=float, nargs=3, default=[1.0, 1.0, 5.0])
     p.add_argument("--no_oversample", action="store_true")
